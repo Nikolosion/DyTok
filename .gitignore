@@ -13,7 +13,8 @@ venv/
 # данные и результаты (скачиваются/генерируются при запуске)
 data/
 dataset/
-results/
+results/*
+!results/*.json
 *.pt
 *.pth
 *.ckpt
