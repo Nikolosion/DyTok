@@ -20,14 +20,22 @@
 
 import argparse
 import json
+import sys
 import time
 from pathlib import Path
+
+# Консоль Windows может быть cp1251 — принудительно UTF-8, чтобы кириллица не падала
+for _stream in (sys.stdout, sys.stderr):
+    try:
+        _stream.reconfigure(encoding="utf-8", errors="replace")
+    except Exception:
+        pass
 
 import numpy as np
 import torch
 import torch.nn.functional as F
 from torch.utils.data import DataLoader, Dataset
-from torchvision import datasets
+from torchvision import datasets, transforms
 from tqdm import tqdm
 
 from model import MultiTokenizer, RNNClassifier, SymbolicDyTokTokenizer
@@ -40,22 +48,22 @@ def image_to_grid(x, G, P):
     B = x.shape[0]
     patches = F.unfold(x, kernel_size=P, stride=P).view(B, 3 * P * P, -1).permute(0, 2, 1)
     patches = patches.view(B, G * G, 3, P * P)
-    mean = patches.mean(dim=(2, 3))
-    std = patches.std(dim=(2, 3), unbiased=False)
+    mean_c = patches.mean(dim=3)                      # (B, G*G, 3)
+    std_c = patches.std(dim=3, unbiased=False)        # (B, G*G, 3)
     lum = 0.299 * x[:, 0] + 0.587 * x[:, 1] + 0.114 * x[:, 2]
-    gx = F.pad((lum[:, 1:] - lum[:, :-1]).abs(), (0, 1))
-    gy = F.pad((lum[:, 1:, :] - lum[:, :-1, :]).abs(), (0, 0, 0, 1))
+    gx = F.pad((lum[:, :, 1:] - lum[:, :, :-1]).abs(), (0, 1)).unsqueeze(1)   # (B,1,32,32)
+    gy = F.pad((lum[:, 1:, :] - lum[:, :-1, :]).abs(), (0, 0, 0, 1)).unsqueeze(1)
     gx_p = F.unfold(gx, kernel_size=P, stride=P).view(B, G * G, P * P).mean(-1)
     gy_p = F.unfold(gy, kernel_size=P, stride=P).view(B, G * G, P * P).mean(-1)
-    byte = (0.299 * mean[..., 0] + 0.587 * mean[..., 1] + 0.114 * mean[..., 2])
+    byte = (0.299 * mean_c[..., 0] + 0.587 * mean_c[..., 1] + 0.114 * mean_c[..., 2])
     byte = byte.mul(255).round().clamp(0, 255).long()
-    feat = torch.cat([mean, std, gx_p[..., None], gy_p[..., None]], dim=-1)
+    feat = torch.cat([mean_c, std_c, gx_p[..., None], gy_p[..., None]], dim=-1)  # (B, G*G, 8)
     return byte.view(B, G, G), feat.view(B, G, G, -1)
 
 
 def make_collate(G, P):
     def collate(batch):
-        imgs = torch.stack([b[0] for b in batch]).float().div_(255.0)
+        imgs = torch.stack([b[0] for b in batch])  # (B,3,32,32) float [0,1] (ToTensor)
         y = torch.tensor([b[1] for b in batch], dtype=torch.long)
         bg, pf = image_to_grid(imgs, G, P)
         return {"image": (bg, pf), "labels": y}
@@ -109,7 +117,7 @@ def build_model(n_classes, args, device):
 def train_step(model, loader, opt, device, aux_w=0.25, sp_w=1e-3):
     model.train()
     tot, n = 0.0, 0
-    for batch in tqdm(loader, desc="daytime", leave=False):
+    for batch in tqdm(loader, desc="daytime", leave=False, file=sys.stdout):
         inp = {"image": (batch["image"][0].to(device), batch["image"][1].to(device))}
         y = batch["labels"].to(device)
         opt.zero_grad(set_to_none=True)
@@ -155,7 +163,7 @@ def cl_metrics(A, cps):
     task_acc = [[float(np.mean([A[t][c] for c in range(i * cps, (i + 1) * cps)]))
                  for i in range(t + 1)] for t in range(T)]
     AA = float(np.mean([np.mean(row) for row in task_acc]))
-    BWT = float(np.mean([task_acc[T - 1][i] - task_acc[i][i] for i in range(T - 1)]))
+    BWT = float(np.mean([task_acc[T - 1][i] - task_acc[i][i] for i in range(T - 1)])) if T > 1 else 0.0
     Fgt = max(0.0, float(np.mean(
         [max(task_acc[t][i] for t in range(i, T)) - task_acc[T - 1][i] for i in range(T)])))
     return AA, BWT, Fgt
@@ -197,12 +205,13 @@ def main():
     torch.manual_seed(args.seed)
     np.random.seed(args.seed)
     device = "cuda" if torch.cuda.is_available() else "cpu"
-    G = P = 4 * 2  # 32x32 -> сетка 4x4 из патчей 8x8
+    G, P = 4, 8   # 32x32 -> сетка 4x4 из патчей 8x8
     collate = make_collate(G, P)
 
     ds_cls = datasets.CIFAR100 if args.dataset == "cifar100" else datasets.CIFAR10
-    base_train = ds_cls(root=args.data, train=True, download=True)
-    base_test = ds_cls(root=args.data, train=False, download=True)
+    tf = transforms.ToTensor()
+    base_train = ds_cls(root=args.data, train=True, download=True, transform=tf)
+    base_test = ds_cls(root=args.data, train=False, download=True, transform=tf)
     num_classes = len(base_train.classes)
     cps = num_classes // args.steps
     assert num_classes % args.steps == 0, "число классов должно делиться на шаги"
@@ -216,7 +225,7 @@ def main():
     model = build_model(cps, args, device)
     n_params = sum(p.numel() for p in model.parameters())
     print(f"[init] {args.dataset}: {num_classes} классов, {args.steps} шагов × {cps}, "
-          f"batch={args.batch}, epochs={args}.epochs, sleep_steps={args.sleep_steps}, "
+          f"batch={args.batch}, epochs={args.epochs}, sleep_steps={args.sleep_steps}, "
           f"no_sleep={args.no_sleep}, device={device}, params={n_params/1e6:.2f}M")
 
     A = []           # переклассовая точность по шагам
@@ -278,11 +287,12 @@ def main():
         if probe is None:
             probe = collect(test_loader, 64, device)
             with torch.no_grad():
-                _, sids, _, _, _ = model.tokenizer({"image": probe["image"]})
-            ref_ids = {"image": sids}
+                _, _, _, _, auxs = model.tokenizer({"image": probe["image"]})
+            ref_ids = {n: auxs[n]["ids"].reshape(auxs[n]["ids"].shape[0], -1)
+                       for n in model.tokenizer.names}   # VQ-id на патч (B, L)
         else:
             log["id_stability_vs_s1"] = round(
-                float(model.tokenizer.id_stability({"image": probe["image"]}, ref_ids)), 4)
+                float(model.tokenizer.id_stability({"image": probe["image"]}, ref_ids)["image"]), 4)
 
         # Конец шага: заморозка anchors + снапшот снов (реплей для следующего sleep)
         if not args.no_sleep:

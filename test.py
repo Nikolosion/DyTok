@@ -82,10 +82,10 @@ def image_to_grid(pil_img):
     mean, std = patches.mean(dim=1), patches.std(dim=1)          # (3, L) каждый
 
     lum = 0.299 * x[0] + 0.587 * x[1] + 0.114 * x[2]             # (S,S)
-    gx = F.pad((lum[:, 1:] - lum[:, :-1]).abs(), (0, 1))[None, None]
-    gy = F.pad((lum[1:, :] - lum[:-1, :]).abs(), (0, 0, 0, 1))[None, None]
+    gx = F.pad((lum[:, 1:] - lum[:, :-1]).abs(), (0, 1))[None, None]          # (1,1,S,S)
+    gy = F.pad((lum[1:, :] - lum[:-1, :]).abs(), (0, 0, 0, 1))[None, None]    # (1,1,S,S)
     gx = F.unfold(gx, kernel_size=P, stride=P)[0].mean(dim=0)    # (L,)
-    gy = F.unfold(gy, kernel_size=P, stride=P)[0].mean(dim=0)
+    gy = F.unfold(gy, kernel_size=P, stride=P)[0].mean(dim=0)    # (L,)
 
     byte = (0.299 * mean[0] + 0.587 * mean[1] + 0.114 * mean[2])
     byte = byte.mul(255).round().clamp(0, 255).to(torch.uint8)
