@@ -1,0 +1,23 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+
+# venv
+venv/
+.venv/
+
+# логи
+*.log
+
+# данные и результаты (скачиваются/генерируются при запуске)
+data/
+dataset/
+results/
+*.pt
+*.pth
+*.ckpt
+
+# IDE
+.idea/
+.vscode/
