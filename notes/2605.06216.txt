@@ -1,0 +1,1613 @@
+===== PAGE 1 =====
+TIDE: Every Layer Knows the Token
+Beneath the Context
+Ajay Jaiswal,Lauren Hannah,Han-Byul Kim,Duc Hoang,Mehrdad Farajtabar,Minsik Cho
+Apple
+We revisit a universally accepted but under-examined design choice in every modern LLM: a token index
+is looked up once at the input embedding layer and then permanently discarded. Thissingle-injection
+assumptioninduces two structural failures: (i) theRare Token Problem, where a Zipf-type distribution
+of vocabulary causes rare-token embeddings are chronically under-trained due to receiving a fraction of
+the cumulative gradient signal compared to common tokens; and (ii) theContextual Collapse Problem,
+where limited parameters models map distributionally similar tokens to indistinguishable hidden states. As
+an attempt to address both, we proposeTIDE, which augments the standard transformer withEmbed-
+dingMemory: an ensemble ofKindependentMemoryBlocks that map token indices to context-free
+semantic vectors, computed once and injected into every layer through a depth-conditioned softmax router
+with a learnable null bank. Wetheoreticallyandempiricallyestablish the benefits ofTIDEin addressing
+the issues associated with single-token identity injection as well asimprove performanceacross multiple
+language modeling and downstream tasks.
+Correspondence:Ajay Jaiswal: ajaiswal23@apple.com
+Date:May 8, 2026
+1 Introduction
+Scaling modern large language models (LLMs) involves devoting substantial representational capacity to-
+wardscontextualizingtokens through innovating attention mechanisms, enlarging feed-forward modules, and
+stacking deep transformer layers. In contrast, a critical LLM component that has been widely overlooked in
+recent advancements is thetoken index-the only piece of information that unambiguously identifies what
+a token is. The token index is looked up once at the input embedding layer and then permanently discarded.
+Every subsequent computation across allLtransformer layers operates on a contextualized hidden state that
+never again directly consults which vocabulary entries are being processed. This single-injection assumption
+creates twodistinct failure modes:
+❶The Rare Token Problem:Natural language vocabularies obey power law scaling, specifically Zipf’s law
+(Zipf, 1949; Pilgrim and Hills, 2021): the most frequent 1% of tokens account for∼80%of corpus occurrences.
+Under SGD, cumulative gradient signal for each token embedding is proportional to its frequency (Section
+2.1), leaving rare-token embeddings (e.g. rare named entities, technical terms, low-frequency morphological
+forms) persistently under-trained (Figure 1).
+❷Contextual Hidden State Collapse:During training, FFNs are forced intorepresentational overloading
+where they simultaneously implement structural transformations of the residual stream and serve as the
+primary store of token-specific factual knowledge (Meng et al., 2022; Dai et al., 2022). The token index
+is never re-consulted at intermediate layers, and the only mechanism the FFNs have to differentiate two
+tokens at depth relies on contextual mixture of residual and attention output. However, in case when two
+semantically distinct tokens appear in nearly identical syntactic environments, the context provides limited
+differentiating signal and their hidden states become nearly indistinguishable across the network (Figure 2).
+1
+arXiv:2605.06216v1  [cs.CL]  7 May 2026
+===== PAGE 2 =====
+Bin 0 Bin 1 Bin 2 Bin 3 Bin 4 Bin 5 Bin 6 Bin 7 Bin 8 Bin 9
+Frequency Based T oken Bins
+0.4
+0.6
+0.8
+1.0
+1.2
+1.4
+1.6
+1.8
+Embedding L2 Norm E[v] 2
+  Rare zone
+(bins 0 2)
+Common zone 
+(bins 7 9)
+Gap = 0.607
+Rare = 0.61× common
+Std(±) band
+Mean norm E[v] 2
+0.798
+0.934
+1.109
+1.298
+1.417
+1.463 1.489 1.514 1.549
+1.601
+0.00 0.25 0.50 0.75 1.00 1.25 1.50 1.75 2.00
+Embedding L2 Norm E[v] 2
+0
+2
+4
+6
+8
+Density
+Rare tokens (bins 0 2)
+Common tokens (bins 7 9)
+Rare mean = 0.958
+Common mean = 1.555
+Bin 0 Bin 1 Bin 2 Bin 3 Bin 4 Bin 5 Bin 6 Bin 7 Bin 8 Bin 9
+Frequency Based T oken Bins
+0.04
+0.02
+0.00
+0.02
+0.04
+Norm growth rate ( ev 2 per 50B tokens)
+-0.045
+-0.032
+-0.018
+-0.005
++0.003
++0.006+0.008+0.010
++0.013
++0.017
+ Rare Zone
+(bins 0 2)
+Common Zone 
+(bins 7 9)
+Rare (0 2)
+Mid (3 6)
+Common (7 9)
+Figure 1Empirical Evidence that Rare T oken Embeddings Remain Under-trained:(a) Mean embedding
+l2-norm of LLaMa-Base-1B pretrained checkpoint showing a monotonic increasein norm from rare to common bins;
+(b) Embedding norm distributions for rare and common tokens: existence ofwide raredistribution versus the narrow
+common peakconfirms that rare embeddings remain noise-dominated and under-trained; (c) Bin-wise norm growth
+rate across intermediate training checkpoints per 50 billion tokens: rare token norms exhibitmonotonic declinewith
+continued training while common token continue growing.
+Motivated by these challenges, we pose a critical question:How can we provide every transformer layer
+with persistent, token-identity-conditioned knowledge, independent of and complementary to the contextual
+residual stream?Unlike prior approaches that focus on post-hoc analysis ofde factoFFNs (Geva et al.,
+2022b; Meng et al., 2022, 2023) or retrofit external retrieval at inference time (Lewis et al., 2020b; Borgeaud
+et al., 2022b; Izacard et al., 2023), we adopt an alternative approach: designing and training from scratch a
+novel transformer architecture that maintains a dedicated semantic memory indexed directly by static token
+identity information.
+In this work, we proposeTIDE(TokenIdentityDeliveredEverywhere), an architectural modification to
+standard transformer that maintains a dedicated semantic memory indexed directly by token identity (Figure
+3).TIDEintroducesEmbeddingMemory, an ensemble ofKindependentMemoryBlocks each mapping
+token indices to static and context-free learned semantic vectors that can be injected to each transformer
+layer with a persistent, token-conditioned signal in parallel to the contextual residual stream. Our key
+contributions can be summarized as:
+•Architectural.TIDEintroduces atoken-level unified embedding memorythat enablesKdisjoint
+pathways for token-level gradient accumulation. The tensor from memory embeddings tensor is com-
+putedonce per forward passand injected intoeverytransformer layer via a per-layer softmax routing
+mechanism conditioned on the post-attention hidden state.
+•Theoretical.We formalize the two failure mode in standard transformer and prove thatTIDE(i)
+asymptotically generalizes the standard transformer; (ii) amplifies the per-token cumulative gradient
+signal by a factor ofK, and (iii) routes around the FFN’s Lipschitz constraint by exposing a discrete,
+token-indexed input with no obligation to hidden states.
+•Empirical.We empirically validate thatTIDEsignificantly benefitsraretokens and mitigates contex-
+tual collapse problem. Across model scales from350M to1B parameters,TIDEconsistently delivers
+up to performance improvements over standard transformer across various language modeling datasets
+(e.g.,Wikitext, PubMed, DCLM) as well as downstream tasks (e.g.,HellaSwag, ARC, PIQA).
+2 When Context is Not Enough: Diagnosing Standard Transformers
+2.1 The Rare Token Problem.
+Gradient Starvation Bottleneck:Under minibatch SGD with batch sizeB, sequence lengthT, and per-
+token squared gradient norm bounded byG2, the embeddingev∈R d for tokenvreceives a non-zero gradient
+only whenvappears in the current batch. In this setting, the expected cumulative squared gradient norm
+2
+===== PAGE 3 =====
+afterτtraining steps satisfies:
+E
+[ τ∑
+s=1
+∥∇evLs∥2
+]
+≤τ·f v·B·T·G 2,(2.1)
+wheref v := Pr[uniformly drawn token position equalsv]∈(0,1)is the unigram probability ofv, with∑
+v∈Vfv = 1. Tokenvisrareiff v =ϵfor someϵ≪1/(BT), and tokenuiscommoniff u ≥cfor
+some constantc>0independent of|V|. The full derivation of equation 2.1 is given in Appendix C.
+Tier Bin(s) Countf v E[Nv]
+Hapax (rarest) 0 1 8.3×10−9 ≈1,660
+Near-hapax 1 ∼4 3.3×10−8 ≈6,640
+Uncommon 2 ∼10 8.3×10−8 ≈16,600
+Mid-freq. 3–6 ∼102–3 ∼10−6 ≈105–6
+Common (highest) 7–9 ∼106 8.3×10−3 ≈1.66×10 9
+Table 1Expected non-zero gradient updatesE[N v]of token bins with 200B training tokens.
+In anexample corpusof Wikitext-103 (Merityet al., 2016)tokenized using LLaMA-3tokenizer (|V|= 128,256)
+to generate frequency bins (Appendix B), the gradient disparity betweenrareandcommontokens becomes
+severe. Over a training budget of 200B tokens withB= 8,T= 2048, the expected number of non-zero
+gradient updates to tokenv’s embedding is given as:
+E[Nv] =τ
+(
+1−(1−f v)BT) ≈τ·f v·BTfor smallf v.(2.2)
+In reference to frequency bins defined in Appendix B, Table 1 instantiates this across the200B tokens in
+our training dataset illustrating the existence of high gradient update disparity between rare and common
+tokens. Additionally, it can empirically inferred from the Figure 1(c) that this disparity doesn’t limit itself
+as a cold-start artifact but growsmonotonicallyas the training progresses. The rare tokens’ norms decline
+while common tokens’ norms continuously increase.
+Ratio of gradient signal for rare and common tokens:For rarev(fv =ε) and commonu(f u≥c>0),
+letG 2min >0be a lower bound on the per-step squared gradient norm conditioned on tokenuappearing in
+a batch. The ratio of cumulative gradient signals satisfies:
+E
+[∑
+s∥∇evLs∥2]
+E[∑s∥∇euLs∥2] ≤ εBTG 2κG 2min =O(ε/c)(2.3)
+whereκ:= 1−(1−c) BT >0withBT,G 2, andG 2min as fixed positive constants. The full derivation is
+given in Appendix C.1. For the empirical instantiation in Table 1, the ratio between rare tokens (Bin 1) and
+common tokens (Bin 9) isε/c≈10−6, a disparity of six orders of magnitude of gradient signal between rare
+and common tokens over the same training budget.
+2.2 Contextual Collapse and the FFN’s Blind Spot.
+As mentioned before, the gradient starvation issue causes the rare-token embeddings to converge to low-
+norm, noisy representations. More seriously, when two distinct tokens carry poorly trained embeddings of
+similar magnitude, a deeper structural failure arises: the hidden states produced for those tokens across all
+transformer layers may become indistinguishable, which can more problematic with similar context shared.
+We formalize this failure mode and show that it is an inherent consequence of the Lipschitz continuity imposed
+on any FFN by its continuous domain.
+The Contextual Collapse Phenomenon:At each layerℓ, the hidden stateh (ℓ)v ∈R d of a tokenvis produced
+by the attention mechanism operating on the surrounding context. When two tokensu̸=vappear in nearly
+identical syntactic environments, such as in case for grammatical homophones (theirorthere), numeric
+3
+===== PAGE 4 =====
+then 
+ than
+further 
+ farther
+discreet 
+ discrete
+affect 
+ effect
+compl. 
+ compli.
+continual 
+ continu.
+imply 
+ infer
+principal 
+ principle
+among 
+ between
+accept 
+ except
+their 
+ there
+less 
+ fewer
+its 
+ it's
+who 
+ whom
+your 
+ you're
+3  4
+ 2  3
+ 1  2
+   
+1847 
+ 1851
+pi  phi
+1918 
+ 1945
+0  1
+zero 
+ one
+100 
+ 1000
+aphasia 
+ apraxia
+stochastic 
+ determin.
+exoplanet 
+ protoplan.
+ibuprof. 
+ acetam.
+oligodend. 
+ astrocyte
+T eotihu. 
+ Tlatelol.
+hypothyr. 
+ hyperthyr.
+morphine 
+ fentanyl
+mitosis 
+ meiosis
+xenotrans. 
+ allotrans.
+amoxicil. 
+ cefurox.
+fibril. 
+ tachycard.
+catalysis 
+ electrol.
+ischemia 
+ hypoxia
+photosynth. 
+ chemosynth.
+0
+2
+4
+6
+8
+10
+12
+14
+16
+18 Transformer Layer
+Grammatical Homophones Numeric Identity Tokens Rare Domain Tokens
+0
+20
+40
+60
+80
+100
+120
+140
+Mean L  Distance ( h_u  h_v )
+Figure 2Empirical Evidence of Contextual Collapse:Heatmap illustrating the meanℓ 2-distance∥h (ℓ)u −h (ℓ)v ∥
+between hidden states (LLaMa-Base-1B) of token pairs across 250 template sentences from three example categories
+of contextual collapse. For all sampled pairs, the distance remainsnear-zerofor majority of layers (except towards
+end) confirming the presence of contextual collapse.
+identity tokens (1847,1851, or1849), or rare domain-specific synonyms (ibuprofenoracetaminophen), the
+context provides no distinguishing signal and thereby attention produces similar outputs for both.
+We formally define this as:
+Definition 2.1(Contextual Collapse Set).For a toleranceδ >0, thecontextual collapse setat layerℓcan
+be formally defined as:
+C(ℓ)δ := {(u,v)∈V 2 :u̸=v,∥h (ℓ)u −h (ℓ)v ∥≤δ },
+where the hidden states are averaged over a representative corpus of contexts.
+Figure 2 provides direct empirical evidence of contextual collapse in LLaMa-Base-1B standard model esti-
+mated using 150 template sentences that differ by a single token pair under consideration. For each of the
+three example canonical categories, the meanℓ2 distance∥h (ℓ)u −h (ℓ)v ∥remains persistently small across the
+entire depth axis except the last few final layers, confirming the prevalent existence of collapse. Note that this
+phenomenon is more severe across numerical tokens category having notable collapse (smallδ) even within
+the final layer’s hidden states.
+Proposition 2.2(FFN Approximation Lower Bound on Collapsed Tokens).Let(u,v)∈C (ℓ)δ be a collapsed
+token pair and letg:V→R d be any target function satisfying∥g(u)−g(v)∥=C >0. Then foranychoice
+of weightsW 1,W 2:
+max
+{
+∥FFN(hu)−g(u)∥,∥FFN(h v)−g(v)∥
+}
+≥ C−L FFNδ2 .
+WhenC >L FFNδ, the right-hand side is strictly positive: the FFN cannot approximategto arbitrary precision
+on the collapsed pair(u,v), regardless of how many parameters it has.
+Proof sketch.Since(u,v)∈C (ℓ)δ , the Lipschitz bound forces∥FFN(hu)−FFN(hv)∥≤L FFNδ. Applying the
+triangle inequality to the target separationC=∥g(u)−g(v)∥and substituting this bound yields∥FFN(hu)−
+g(u)∥+∥FFN(h v)−g(v)∥≥C−L FFNδ. Since the maximum of two non-negative terms is at least half their
+sum, the result follows. See Appendix D for details.
+In this bound,δis determined by the embeddings and attention layers; it is fixed before the FFN acts. The
+separation targetCis determined by the downstream task.The Lipschitz constantLFFN is the only term the
+FFN controls, but it is bounded in practice because largeLFFN amplifieseveryinput perturbation, degrading
+performance on the majority of non-collapsed tokens. The bound exposes a structural limitation: given fixed
+upstream representations, no FFN, regardless of width, can resolve a collapsed token pair without destabi-
+lizing other inputs. The token index is injected once at the embedding layer and never reintroduced; unlike
+position, which is re-injected via RoPE at every attention layer, token identity has no recovery mechanism.
+Once intermediate layers erase the distinction, it is permanently lost to all subsequent computation.
+4
+===== PAGE 5 =====
+Embedding Layer
+LM HeadSelf
+Attention FeedForward
+Jack
+loves
+his
+coffee
+with
+Jack
+loves
+his
+coffee
+with
+sugar
+Layer 0
+Self
+Attention Feed
+Forward
+ = Input Embedding
+Residual
+Information Stream
+L1
+L2
+L N-2
+MemoryBlock 1
+Memory Router
+Shared Embedding Memory Across All Layers
+MemoryBlock 2 MemoryBlock K
+Layer N-1 NULL BANK
+Memory Router
+Figure 3Main Architecture Diagram:TIDEaugments standard transformers with a parallel and globally
+sharedEmbeddingMemorymodule (red region) consisting ofKindependentMemoryBlock, each mapping raw
+token indices tocontext-free token identity signal. Each layer uses a linear router to combine memory blocks signals
+and injects that into the residual stream additively.
+3 TIDE: T oken I dentity D elivered E verywhere
+In section 2, we investigated and formalized two failure mode,i.e.,rare token and contextual collapse problem,
+within the standard transformer architecture. In this work, we address these issues with a novel architecture
+modification:TIDEcounters the single-injection assumption in conventional design of modern LLMs.TIDE
+stops discarding the token identity information after embedding layer and instead make it directly accessible
+at every depth, so that each layer retains a token-discriminative signal independent of the contextual residual
+stream.
+3.1 Preliminaries and Notations.
+LetVdenote a vocabulary of size|V|,dthe model hidden dimension,d b thememoryblockembedding
+dimension,Kthe number ofmemoryblocks,Lthe number of transformer layers,Tthe input sequence
+length, andBthe batch size. We usex∈Z B×T for a batch of token index sequences andh(ℓ)∈R B×T×d for
+hidden states at layerℓ. The standard LLaMA-style transformer block at layerℓcomputes:
+˜hℓ =h ℓ−1 + Attn(RMSNorm(hℓ−1)),(3.1)
+hℓ = ˜hℓ + FFN(RMSNorm(˜hℓ)),(3.2)
+whereAttnis multi-head self-attention with rotary position embeddings andFFNis a SiLU-gated feed-
+forward network. The primary embedding tableE∈R|V|×d maps each token index to an initial hidden state
+h(0) =E[x]that will be processed by different transformer blocks.
+3.2 TIDE Architecture Design.
+TIDEaugments the standard transformer with a paralleltoken-identity memory pathwaycomposed of three
+components:
+memoryblocks:Each of theKmemoryblocks maintains a dedicated embedding tableE k∈R|V|×d b and
+maps a token indexv∈Vto ad b-dimensional vector via a single embedding lookup followed by RMSNorm
+(Zhang and Sennrich, 2019):
+Mk(v) = RMSNorm
+(
+Ek[v]
+)
+∈R db.(3.3)
+Each block maintains its own independent embedding table with no parameter sharing across blocks, encour-
+aging eachmemoryblockto learn a distinct projection of the token identity space.
+5
+===== PAGE 6 =====
+0 1 2 3 4 5 6 7
+Parameter Count (Billions)
+LLaMA-base-1B
+TIDE-2E-1B
+TIDE-4E-1B
+TIDE-8E-1B
+TIDE-16E-1B
+TIDE-24E-1B
+1.03B
+1.028 GB
+1.03B 0.53B
+1.028 GB 0.263 GB
+1.03B 1.05B
+1.028 GB 0.525 GB
+1.03B 2.10B
+1.028 GB 1.051 GB
+1.03B 4.20B
+1.028 GB 2.101 GB
+1.03B 6.30B
+1.028 GB 3.152 GB
+VRAM vs. SSD Parameters
+VRAM Params (8-bit)
+SSD Params (4-bit)
+Figure 4VRAM & SSD parameter breakdown across LLaMA-Base-1B andTIDE-1B model family with varying
+MemoryBlockcountsK∈{2,4,8,16,24}.
+EmbeddingMemoryensemble:TheKmemoryblocksarestackedintoasinglememorytensorcomputed
+onceper forward pass and shared across allLtransformer layers:
+M= Stack k
+(
+Mk(x)
+)
+∈R B×T×K×d b.(3.4)
+Depth-conditioned router and additive fusion:Within each transformer block, the post-attention
+normalised hidden state˜nℓ = RMSNorm( ˜hℓ)is fed to a lightweight linear router to generate composition
+ratioα ℓk corresponding tok-th memory block. We additionally introduce anull bankat slotK+1satisfying
+MK+1(v) =0for allv, giving the router a learned “off” switch for with no dedicated parameters. The full
+TIDElayer update is:
+αℓ = softmax(Wℓr ˜nℓ)∈R K+1,(3.5)
+mℓ(v) =
+K+1∑
+k=1
+αℓkMk(v), h ℓ = ˜hℓ + FFN(˜nℓ) +mℓ(v).(3.6)
+whereW ℓr∈R (K+1)×d is a per-layer learned weight matrix and∑K+1k=1 αℓk = 1,α ℓk >0for allk. The memory
+vectorm ℓ(v)is addedadditivelyandindependentlyof the FFN output: neither pathway interact with the
+other, preserving the residual stream’s role as a shared communication channel (Elhage et al., 2021). Given
+thatMis indexed by discrete token identityv, not by hidden stateh ℓ, the memory contribution of each
+token is independent of contextual mixing at any depth.
+Computational and Memory Overhead:InTIDE, eachM k(v) = RMSNorm(E k[v])is a single em-
+bedding lookup followed by RMSNorm andcontributes no matrix multiplications, so the per-layer overhead
+reduces to one(K+1)-way softmax router and a weighted sum ofdb-dimensional vectors. This is negligible
+relative to the baseline FFN. More importantly, everyEk is indexed by discrete token identityvindepen-
+dent ofhℓ, so once training completes theEmbeddingMemorytables are static and can be 4-bit quantized
+(negligible performance impact) and offloaded to SSD for on-demand asynchronous prefetch augmented with
+appropriate caching mechanism. As Figure 4 shows, this maintains theeffective VRAM footprintofTIDE
+similar as LLaMA-Base-1B level (1.03GB in 8-bit) while the SSD footprint scales from0to3.152GB from
+K=0toK=24. AdditionaldetailsregardinginferenceoverheadandMemoryBlockscompressiontechniques
+can be found in Appendix I and J.
+6
+===== PAGE 7 =====
+3.3 TIDE: Theoretical Perspectives and Observations.
+3.3.1 Asymptotic Generalization to Standard Transformer.
+Proposition 3.1(Asymptotic Generalization).LetF base denote the function class of standard transform-
+ers equation 3.2 andFTIDE the class of our proposedTIDEmodels equation 3.6. For anyϵ>0, there exist
+finite router parametersWℓr such that
+‖‖mℓ(v)‖‖<ϵ∀v∈V, ℓ∈{1,...,L}.
+That is,F TIDE can approximate the standard transformerFbase to an arbitrary precision.
+Proof sketch.SinceM K+1(v) =0, any weight assigned to the null bank contributes nothing tomℓ(v). By
+the softmax constraint, increasing the null logitzℓK+1 jointly suppresses all active bank weights:∑Kk=1αℓk =
+K/(K+e zℓK+1)→0asz ℓK+1→∞.
+The triangle inequality then gives
+‖‖mℓ(v)‖‖≤(1−α ℓK+1)·C→0, whereC= max v,k∥Mk(v)∥<∞. Setting
+zℓK+1 =s∗ = log(K(C−ϵ)/ϵ)achieves ‖‖mℓ(v)‖‖< ϵat a finite parameter configuration. The full proof can
+be found in Appendix E.
+3.3.2 TIDE’s K-Pathway Gradient Amplification.
+In section 2.1 for the standard transformer, we discussed that the embeddingev of a rare tokenvreceives a
+non-zero gradient update only in steps wherevappears in the batch, yielding an expected cumulative squared
+gradient norm bounded byτ·f v·BT·G 2. Our proposedTIDE’s architecture provides a design advantage
+ofKindependentMemoryBlocks that enableKdistinct, parallel gradient pathways into each token’s
+embedding tables oneverytraining step, regardless of how rarely it occurs in the corpus. We formalize the
+advantage as:
+Proposition 3.2(K-Pathway Gradient Amplification).LetL s denote the loss at stepsand lete(k)v ∈R db be
+the embedding of tokenvinMemoryBlockk. Under minibatch SGD, the total expected cumulative squared
+gradient norm across allKembedding tables for tokenvsatisfies:
+E
+[ τ∑
+s=1
+K∑
+k=1
+‖‖‖∇e(k)v Ls‖‖‖2] ≥K·τ·κ v·G 2min,(3.7)
+whereκv = 1−(1−f v)BT≈f v·BTfor smallf v, andG 2min >0is a lower bound on the per-step squared gradi-
+ent norm conditioned on tokenvappearing in the batch. Consequently,TIDEprovides aK-fold amplification
+of gradient signal relative to the standard single-embedding baseline.
+Proof sketch.EachMemoryBlockkmaintains an independent embedding tableE k∈R|V|×d b with no
+parameter sharing across blocks1. Within a forward pass during training,MemoryBlockk’s outputMk(v)
+is injected into every transformer layerℓvia the routing weightαℓk, contributing to the residual stream and
+thereby to the loss. Since theKblocks are independent, the event{v∈batch s}triggers gradient flow
+through allKembedding tables simultaneously. Because router weights are strictly positive for finite logits,
+each table receives a non-degenerate gradient on every step thatvappears. Summing across blocks and
+applying the lower bound from Appendix C.1 independently to each yields theK-fold amplification. Please
+see Appendix F for details.
+⋆Empirical Investigation[Rare Tokens Benefits fromTIDE]:Figure 5(a) illustrate the mean cross-
+entropy of LLaMa-Base-1B andTIDE-8E-1B at the matched200B-token training budget across all10token
+frequency deciles. Clearly, we can observe thatTIDEstrictly outperformsLLaMa-Base-1B on every decile,
+but the absolute performance gap is sharply asymmetric forrare vs. commontokens. Per-decile loss reduction
+in Figure 5(b) decaysmonotonicallyfrom0.704nats (9.0%relative) on the rarest decile to0.068nats (2.4%)
+on the most frequent decile, yielding a∼4.8×disparity in absolute gain betweenrareandcommonmean.
+This rare-skewed improvement profile is precisely the empirical signature provide support forK-fold gradient
+amplification to assist tokens where base embeddingEis gradient starved during training.
+1For the simplicity, we state the argument for a router overKactive banks.
+7
+===== PAGE 8 =====
+0 10%
+(rarest)
+10 20%
+ 20 30%
+ 30 40%
+ 40 50%
+ 50 60%
+ 60 70%
+ 70 80%
+ 80 90%
+ 90 100%
+(most freq)
+3
+4
+5
+6
+7
+8
+9
+Mean Cross-Entropy Loss (nats)
+Rare zone (bins 0 2)
+ Common zone (bins 7 9)
+Base-Model
+TIDE (Ours) 0.70
+  0.51
+ 0.30
+ 0.19
+  0.12
+  0.14
+ 0.13
+ 0.13
+ 0.12
+ 0.07
+0
+10%
+10
+20%
+20
+30%
+30
+40%
+40
+50%
+50
+60%
+60
+70%
+70
+80%
+80
+90%
+90
+100%
+0.0
+0.1
+0.2
+0.3
+0.4
+0.5
+0.6
+0.7
+0.8
+0.9
+Loss Reduction (Base  TIDE)  nats
+0.704
+(9.0%)
+0.507
+(6.5%)
+0.301
+(5.2%)
+0.194
+(4.2%)
+0.122
+(2.6%)
+0.138
+(3.0%)
+0.135
+(3.1%) 0.125(3.1%) 0.118(3.2%) 0.068
+(2.4%)
+Rare zone
+(bins 0 2)
+Common zone
+(bins 7 9)
+Rare (0 2)
+Mid (3 6)
+Common (7 9)
+Rare mean = 0.504 nats
+Common mean = 0.104 nats
+Figure 5Mean validation cross-entropy loss per frequency decile of LLaMa-Base-1B andTIDE-8E-1B trained with
+200B tokens.TIDEstrictly improves over the baseline on every decile with gain concentrated forraretokens and
+follows monotonically decreasing trend asrare>mid>common.
+3.3.3 Contextual Collapse and TIDEK-MemoryBlocks.
+In a standard transformer, FFN receivesh(ℓ) as input, and when‖‖‖h(ℓ)u −h (ℓ)v ‖‖‖≤δis small, Lipschitz continu-
+ity forces its outputs to remain close regardless of the weights chosen (see Section 2.2).TIDEarchitectural
+design permits to break this constraint since eachMemoryBlockis indexed by the discrete token identity
+vunlikeh (ℓ), so its output carries no continuity obligation with respect toδ. We formalize this observation
+as:
+Proposition 3.3(Memory Ensemble Resolves Collapsed Token Separation).Let(u,v)∈C (ℓ)δ be a collapsed
+token pair satisfying
+‖‖‖h(ℓ)u −h (ℓ)v ‖‖‖≤δ, and letC >0be any target separation. For anyK≥1, there exist
+EmbeddingMemoryparameters{E k}Kk=1 such that:
+∥Mk(u)−M k(v)∥=C(3.8)
+regardless ofδ=
+‖‖‖h(ℓ)u −h (ℓ)v ‖‖‖ and independently ofLFFN.
+Proof sketch.EachMemoryBlockoutputM k(v) = RMSNorm(E k[v]), whereE k[v]is the row of em-
+bedding tableE k indexed by the discrete token identityv. The hidden stateh (ℓ) does not appear in this
+computation, soMk(u)andM k(v)depend only on their respective rowsEk[u]andE k[v]. Since these rows
+areseparate, uncoupled parameters, they can be assigned freely and independently for any token pair(u,v),
+regardless of how smallδis. In particular, one can chooseEk[u]andE k[v]such that the resulting RMSNorm
+outputs can achieve any prescribed separationC >0, which satisfies equation 3.8. See Appendix G for the
+additional details.
+We would like to clarify thatTIDEdoes not attempt to fight the Lipschitz constraint of the FFN; it
+routes around it by exploiting a fundamentally different input signal during the training. Becausem(ℓ)(v) =∑K
+k=1αℓkMk(v)is re-injected in additive fashion at every transformer layer via independent per-layer router
+weightsW ℓr, this token-discriminative signal persists throughout the residual stream, it enables effective
+separation at every layerℓ.
+⋆Empirical Investigation[Contextual Collapse is Moderated byTIDE]:To empirically validate
+the contribution of additive pathways ofMemoryBlocks, we revisit the three example contextual collapse
+categories from Figure 2 (grammatical homophones, numeric identity tokens, rare domain tokens) and com-
+pare the layer-wiseℓ 2 separation∥h (ℓ)u −h (ℓ)v ∥between LLaMa=Base-1B andTIDEon the same template
+sentences. Figure 6 (top row) reports the meanℓ2 norm averaged over all sampled token pairs in each cate-
+gory and bottom row reports the per-layer difference∆ =∥·∥TIDE−∥·∥ Base. Across all three categories, we
+can clearly observe thatTIDE’s token-discriminative signal injection significantly increase inℓ2 separation
+prominently from middle to terminal layers which are distant from base embeddingE. Note thatnumerical
+tokenswhich suffers acute collapse (Figure 2), are the predominant beneficiary of the token identity injection
+throughout all layers.
+8
+===== PAGE 9 =====
+0
+50
+100
+150
+200L2 Norm  h_v
+Grammatical Homophones
+Base-Model
+TIDE (Ours)  +22.2
+0
+50
+100
+150
+200
+Numeric Identity Tokens
+Base-Model
+TIDE (Ours)  +18.3
+0
+50
+100
+150
+200
+Rare Domain Tokens
+Base-Model
+TIDE (Ours)  +26.1
+0 4 8 12 16
+Transformer Layer
+0
+10
+20 (TIDE  Base)
+TIDE > Base  (+)
+TIDE < Base  ( )
+0 4 8 12 16
+Transformer Layer
+0
+10
+20 TIDE > Base  (+)
+TIDE < Base  ( )
+0 4 8 12 16
+Transformer Layer
+0
+20 TIDE > Base  (+)
+TIDE < Base  ( )
+Figure 6Layer-wiseℓ 2 separation∥h (ℓ)u −h (ℓ)v ∥between hidden states of token pairs from the three example contextual
+collapse categories, averaged across150template sentences.
+6.2
+6.4
+6.6
+6.8
+6.671
+6.454
+6.361 6.353
+6.254 6.250
+Rare Tokens (bins 0 2)
+LLaMa-Base-1B (K=0)
+4.2
+4.4
+4.6
+4.4804.4524.418 4.414 4.367 4.342
+Mid Tokens (bins 3 6)
+0 2 4 8 16 24
+K (Number of MemoryBlocks)
+2.8
+3.0
+3.2
+2.9672.9402.928 2.929 2.893 2.892
+Common Tokens (bins 7 9)
+Slope(rare)/Slope(common) = 3.7×
+Mean CE loss (nats)
+Figure 7Mean cross entropy loss acrossrare, mid,andcommontokens with increasingKMemoryBlocks.
+9
+===== PAGE 10 =====
+Table 2Benchmark results for LLaMA-Base and TIDE variants at 750M, 1B and 3B parameter scales. PPL
+is LAMBDA perplexity (lower is better); BoolQ and LAMBADA use accuracy; all other columns use normalized
+accuracy (%). Best results per scale arebolded.
+Model PPL↓ ARC-C ARC-E BoolQ HellaSwag LAMBADA OBQA PIQA SciQ Average
+750M Parameters
+LLaMA-Base 5.63 34.6 60.463.560.9 62.8 36.8 73.8 85.1 59.7
+TIDE-8E-750M5.18 36.0 61.463.062.6 64.9 37.2 74.8 85.8 60.7
+1B Parameters
+LLaMA-Base 5.19 37.5 64.4 61.7 63.9 64.6 37.6 74.9 86.9 61.4
+TIDE-2E-1B 4.97 37.6 65.7 68.7 64.9 65.1 36.4 75.5 87.1 62.6
+TIDE-8E-1B 4.89 37.5 64.5 69.3 65.3 64.740.875.5 86.6 63.0
+TIDE-16E-1B 4.78 38.7 65.569.765.3 65.7 37.8 75.987.9 63.3
+TIDE-24E-1B4.60 38.9 66.369.566.3 66.437.277.387.2 63.7
+3B Parameters
+LLaMA-Base 4.00 41.2 74.8 69.0 71.9 69.4 40.2 78.193.3 67.2
+TIDE-8E-3B3.86 44.3 75.5 72.3 72.2 70.2 40.6 78.393.2 68.3
+100 200 300 400 500
+Training T okens (B)
+10
+11
+12
+13
+14Perplexity ( )
+WikiText-2 Perplexity
+LLaMA-base-1B
+TIDE-2E-1B
+TIDE-4E-1B
+TIDE-8E-1B
+TIDE-16E-1B
+TIDE-24E-1B
+100 200 300 400 500
+Training T okens (B)
+11
+12
+13
+14
+15Perplexity ( )
+Pubmed Perplexity
+LLaMA-base-1B
+TIDE-2E-1B
+TIDE-4E-1B
+TIDE-8E-1B
+TIDE-16E-1B
+TIDE-24E-1B
+100 200 300 400 500
+Training T okens (B)
+16
+17
+18
+19
+20
+21Perplexity ( )
+DCLM-Heldout Perplexity
+LLaMA-base-1B
+TIDE-2E-1B
+TIDE-4E-1B
+TIDE-8E-1B
+TIDE-16E-1B
+TIDE-24E-1B
+Figure 8Wikitext-2, PubMed, DCLM validation PPL as a function of training tokens indicating monotonic improve-
+ment across increasingKblocks ofTIDEvariants.
+4 Experiments and Ablation Studies
+4.1 Performance Benchmarking of TIDE and Standard Transformer.
+➢Perplexity and Training Dynamics:TIDEintroduces a parallel additiveEmbeddingMemorypath-
+ways within conventional transformers to address the challenges associated with rare tokens and contextual
+collapse (Section 3.3.3, 3.3.2). Here, we first investigate the influence of token-indexed memory’s ability to im-
+prove the language modeling quality of standard transformers. Figure 8 presents the validation perplexity on
+three datasets - Wikitext (Merity et al., 2016), PubMed (Jin et al., 2019) and DCLM (Li et al., 2024) held-out
+corpora as a function of total training tokens for LLaMa-Base-1B andTIDE-1B withK∈{2,4,8,16,24}.
+Clearly, eachTIDEvariantstrictly outperformsLLaMa-Base-1B monotonically fromK= 2toK= 24
+without saturation. Performance gap opens early during training where with 100B tokensTIDEwith merely
+2−4MemoryBlocks already matches the perplexity baseline reaches with 200B tokens, indicating that
+the additional gradient pathways translate to faster effective convergence.
+➢Influence ofKacross acrossRare, Mid, and Commontokens:While perplexity based evaluation
+provide an overall performance benefit ofTIDE, a natural question arises from Proposition 3.2 as:Do these
+KMemoryBlockpathways empirically benefits rare and common tokens equally, and does the marginal
+benefit of additionalKscale with token frequency?Figure 7 decomposes held-out cross-entropy loss across
+rare, mid, and commonbins as a function of increasingK. It can be observed that the absolute loss reduction
+over LLaMA-Base-1B is largest on rare tokens, moving fromK= 0toK= 24reduces rare-bin loss from 6.671
+to 6.250 nats (−0.421) compared to only−0.075 nats on common bin which is a 5.6×difference in absolute
+gain. In addition, the per-block marginal benefit (the slope of each curve) is 3.7×steeper on rare tokens than
+on common tokens, illustrating the alignment with Section 3.3.2. Note that even the smallest configuration
+10
+===== PAGE 11 =====
+E M1 M2 M3 M4 M5 M6 M7 M8
+Embedding space
+E
+M1
+M2
+M3
+M4
+M5
+M6
+M7
+M8
+Embedding space
+0.000 0.964 0.911 0.990 0.843 0.649 0.928 0.990 0.945
+0.964 0.000 0.736 0.708 0.666 0.864 0.739 0.729 0.660
+0.911 0.736 0.000 0.755 0.681 0.764 0.731 0.779 0.701
+0.990 0.708 0.755 0.000 0.745 0.909 0.758 0.712 0.709
+0.843 0.666 0.681 0.745 0.000 0.643 0.716 0.798 0.645
+0.649 0.864 0.764 0.909 0.643 0.000 0.796 0.919 0.819
+0.928 0.739 0.731 0.758 0.716 0.796 0.000 0.806 0.706
+0.990 0.729 0.779 0.712 0.798 0.919 0.806 0.000 0.754
+0.945 0.660 0.701 0.709 0.645 0.819 0.706 0.754 0.000
+0.65
+0.70
+0.75
+0.80
+0.85
+0.90
+0.95
+1.00
+Cosine distance  1 1V v cos(A[v], B[v])
+Figure 9Mean cosine distance between primary embeddingEand 8MemoryBlocks.
+(K= 2)can deliver∼55% of the total rare-token improvement obtained atK= 24(also reflected in PPL in
+Figure 8), suggesting that the bulk of the benefit can be achieved with modest 2-4 memory blocks.
+➢TIDE and Downstream Task Performance:Table 2 reports zero-shot accuracy on a suite of eight
+benchmarks (ARC-C, ARC-E, BoolQ, HellaSwag, LAMBADA, OBQA, PIQA, SciQ) across 750M, 1B, and
+3B parameter scales of LLaMa-BaseandTIDEvariants. Across all settings,TIDEvariants consistently
+outperform standard transformer baselines, confirming the robustness of our proposed architecture. More
+specifically, at the 1B scale,TIDEimproves the average score from 61.4 (Base) to 63.7 (K= 24), a+2.3%
+absolute gain, with monotonic improvement inKon the perplexity column and on six of eight downstream
+tasks.
+4.2 A Deeper Investigation of MemoryBlocks and the NULL Bank.
+The performance results in Section 4.1 establish thatTIDEK-pathways provide informative signal beyond
+the contextual residual stream. We now turn the investigation inward to understand the information stored
+acrossMemoryBlocks and per-layer router dynamics after training.
+➢Distance between Primary Embedding and MemoryBlocks:We first aim to investigate ifTIDE’s
+K-MemoryBlocks converge to substantially distinct subspaces or collapse to replicate the base embedding
+E. Figure 9 (a) reports mean cosine distance (1− 1|V|∑v cos(A[v],B[v])between every pair of embedding
+tables inTIDE-8E-1B. We make two key observations: (a) everyMk without any explicit diversity loss, is
+highly distant fromE(mean cosine distance toEranges from 0.65 to 0.99), confirmingMemoryBlocks do
+not replicate the input-embedding subspace but encode complementary token-identity signal; (b) inter-Mk
+distance is relatively smaller, indicating convergence ofKblocks to overlapping but non-collapsed subspaces.
+➢Bin-wise Router Statistics for MemoryBlocks and the NULL Bank:In reference to our Proposi-
+tion 3.1 which state that TIDE asymptotically generalizes the standard transformer through the NULL bank,
+an empirical question persists:How does the router actually utilize this NULL bank, and does it do so in a
+token-aware manner?Figure 10 reports the mean routing weight¯αk allocated to each memory blockMk and
+to the NULL bank from last layer stratified by frequency bin. We highlight two key observations: (a) the
+NULL-bank weight ismonotonically non-decreasing in token frequency: it rises from¯αNULL = 0.530on the
+rarest decile to0.889on the most common decile. The router has therefore learned to open the gate and admit
+substantial memory-bank mass (1−¯αNULL≈0.47) for rarest tokens in comparison to common tokens; (b)
+the router weight is non-uniform across blocks whereM5 carries an outsized share on rare tokens (¯α5≈0.31)
+11
+===== PAGE 12 =====
+Bank 0Bank 1Bank 2Bank 3Bank 4Bank 5Bank 6Bank 7
+Memory bank
+0 10%
+10 20%
+20 30%
+30 40%
+40 50%
+50 60%
+60 70%
+70 80%
+80 90%
+90 100%
+Frequency bins
+0.008 0.003 0.015 0.002 0.072 0.309 0.061 0.001
+0.017 0.008 0.023 0.006 0.112 0.267 0.034 0.004
+0.017 0.012 0.024 0.001 0.111 0.214 0.055 0.004
+0.011 0.015 0.028 0.001 0.170 0.018 0.043 0.004
+0.010 0.018 0.024 0.000 0.128 0.006 0.035 0.005
+0.011 0.020 0.022 0.001 0.141 0.004 0.033 0.004
+0.011 0.024 0.024 0.001 0.140 0.007 0.032 0.004
+0.008 0.024 0.024 0.001 0.110 0.006 0.039 0.004
+0.008 0.032 0.024 0.001 0.075 0.006 0.041 0.005
+0.003 0.023 0.027 0.001 0.013 0.002 0.040 0.002
+0.00
+0.05
+0.10
+0.15
+0.20
+0.25
+0.30
+Routing weight  k
+0.0 0.2 0.4 0.6 0.8 1.0
+Null-bank weight  ( null)
+0 10%
+10 20%
+20 30%
+30 40%
+40 50%
+50 60%
+60 70%
+70 80%
+80 90%
+90 100%
+Frequency bins
+0.530
+0.529
+0.562
+0.709
+0.774
+0.765
+0.757
+0.785
+0.809
+0.889
+Figure 10Bin-wise mean router weights¯α k acrossMemoryBlocks (left) and the NULL bank (right), stratified by
+token frequency decile.
+before collapsing to near-zero on common tokens wileM4 specializes for mid-decile tokens illustrating that
+distinct banks specialize to distinct frequency regimesrather than redundantly co-firing.
+5 Conclusion
+In this work, we proposeTIDE, a transformer architecture that addresses two empirically established failure
+modes of standard LLMs: gradient starvation of rare tokens and contextual collapse of semantically distinct
+tokens. We introduceEmbeddingMemory, an ensemble ofKindependentmemoryblocks that map token
+indices directly to semantic vectors, injected at every layer via a depth-conditioned router with a NULL bank.
+TIDEprovides each transformer layer with a persistent, token-specific signal that is immune to contextual
+collapse by construction. Wetheoreticallyandempiricallyestablish the benefits ofTIDEin addressing the
+issues associated with single-token identity injection. With extensive experiments across different model scale,
+we foundTIDEconsistentlyimprove performanceacross multiple language modeling and downstream tasks.
+12
+===== PAGE 13 =====
+References
+S. Borgeaud, A. Mensch, J. Hoffmann, T. Cai, E. Rutherford, K. Millican, G. B. Van Den Driessche, J.-B. Lespiau,
+B. Damoc, A. Clark, et al. Improving language models by retrieving from trillions of tokens. InInternational
+conference on machine learning, pages 2206–2240. PMLR, 2022a.
+S. Borgeaud, A. Mensch, J. Hoffmann, T. Cai, E. Rutherford, K. Millican, et al. Improving language models by
+retrieving from trillions of tokens. InProceedings of ICML, pages 2206–2240, 2022b.
+T. Brown, B. Mann, N. Ryder, M. Subbiah, J. D. Kaplan, P. Dhariwal, A. Neelakantan, P. Shyam, G. Sastry, A. Askell,
+et al. Language models are few-shot learners.Advances in neural information processing systems, 33:1877–1901,
+2020.
+D. Chen and W.-t. Yih. Open-domain question answering. In A. Savary and Y. Zhang, editors,Proceedings of the 58th
+Annual Meeting of the Association for Computational Linguistics: Tutorial Abstracts, pages 34–37, Online, July
+2020. Association for Computational Linguistics. doi: 10.18653/v1/2020.acl-tutorials.8. URLhttps://aclanthology.
+org/2020.acl-tutorials.8/.
+D. Chen, A. Fisch, J. Weston, and A. Bordes. Reading wikipedia to answer open-domain questions.arXiv preprint
+arXiv:1704.00051, 2017.
+D. Dai, L. Dong, Y. Hao, Z. Sui, B. Chang, and F. Wei. Knowledge neurons in pretrained transformers. InProceedings
+of ACL, pages 8493–8502, 2022.
+G. Dar, M. Geva, A. Gupta, and J. Berant. Analyzing transformers in embedding space. InProceedings of the 61st
+Annual Meeting of the Association for Computational Linguistics (Volume 1: Long Papers), pages 16124–16170,
+2023.
+N. Elhage, N. Nanda, C. Olsson, T. Henighan, N. Joseph, B. Mann, A. Askell, Y. Bai, A. Chen, et al. A mathematical
+framework for transformer circuits.Transformer Circuits Thread, 2021.https://transformer-circuits.pub/2021/
+framework/index.html.
+M. Geva, R. Schuster, J. Berant, and O. Levy. Transformer feed-forward layers are key-value memories. InProceedings
+of the 2021 Conference on Empirical Methods in Natural Language Processing, pages 5484–5495, 2021.
+M. Geva, A. Caciularu, K. Wang, and Y. Goldberg. Transformer feed-forward layers build predictions by promoting
+concepts in the vocabulary space. InProceedings of the 2022 conference on empirical methods in natural language
+processing, pages 30–45, 2022a.
+M. Geva, A. Caciularu, K. R. Wang, and Y. Goldberg. Transformer feed-forward layers build predictions by promoting
+concepts in the vocabulary space. InProceedings of EMNLP, pages 30–45, 2022b.
+A. Graves, G. Wayne, and I. Danihelka. Neural turing machines.arXiv preprint arXiv:1410.5401, 2014.
+A. Graves, G. Wayne, M. Reynolds, T. Harley, I. Danihelka, A. Grabska-Barwinska, S. G. Colmenarejo, E. Grefen-
+stette, T. Ramalho, J. P. Agapiou, A. P. Badia, K. M. Hermann, Y. Zwols, G. Ostrovski, A. Cain, H. King,
+C. Summerfield, P. Blunsom, K. Kavukcuoglu, and D. Hassabis. Hybrid computing using a neural network with
+dynamic external memory.Nature, 538:471–476, 2016. URLhttps://api.semanticscholar.org/CorpusID:205251479.
+K. Guu, K. Lee, Z. Tung, P. Pasupat, and M. Chang. Retrieval augmented language model pre-training. InInterna-
+tional conference on machine learning, pages 3929–3938. PMLR, 2020.
+X. O. He. Mixture of a million experts.arXiv preprint arXiv:2407.04153, 2024.
+H. Inan, K. Khosravi, and R. Socher. Tying word vectors and word classifiers: A loss framework for language modeling.
+InProceedings of ICLR, 2017.
+G. Izacard, P. Lewis, M. Lomeli, L. Hosseini, F. Petroni, T. Schick, et al. Atlas: Few-shot learning with retrieval
+augmented language models.Journal of Machine Learning Research, 24(251):1–43, 2023.
+A. Jaiswal, S. Liu, T. Chen, Z. Wang, et al. The emergence of essential sparsity in large pre-trained models: The
+weights that matter.Advances in Neural Information Processing Systems, 36:38887–38901, 2023.
+A. Jaiswal, L. Yin, Z. Zhang, S. Liu, J. Zhao, Y. Tian, and Z. Wang. From galore to welore: How low-rank weights
+non-uniformly emerge from low-rank gradients.arXiv preprint arXiv:2407.11239, 2024a.
+A. Jaiswal, L. Hannah, H.-B. Kim, D. Hoang, A. Kundu, M. Farajtabar, and M. Cho. Memoryllm: Plug-n-play
+interpretable feed-forward memory for transformers. InarXiv preprint arXiv:2602.00398, 2026.
+13
+===== PAGE 14 =====
+A. K. Jaiswal, B. Hu, L. Yin, Y. Ro, T. Chen, S. Liu, and A. Akella. Ffn-skipllm: A hidden gem for autoregressive
+decoding with adaptive feed forward skipping. InProceedings of the 2024 Conference on Empirical Methods in
+Natural Language Processing, pages 16943–16956, 2024b.
+S. Jie, Y. Tang, K. Han, Y. Li, D. Tang, Z.-H. Deng, and Y. Wang. Mixture of lookup experts.arXiv preprint
+arXiv:2503.15798, 2025.
+Q. Jin, B. Dhingra, Z. Liu, W. Cohen, and X. Lu. Pubmedqa: A dataset for biomedical research question answering.
+InProceedings of the 2019 conference on empirical methods in natural language processing and the 9th international
+joint conference on natural language processing (EMNLP-IJCNLP), pages 2567–2577, 2019.
+V. Karpukhin, B. Oguz, S. Min, P. S. Lewis, L. Wu, S. Edunov, D. Chen, and W.-t. Yih. Dense passage retrieval for
+open-domain question answering. InEMNLP (1), pages 6769–6781, 2020.
+A. Kaushal, T. Vaidhya, and I. Rish. Lord: Low rank decomposition of monolingual code llms for one-shot compression.
+arXiv preprint arXiv:2309.14021, 2023.
+U. Khandelwal, O. Levy, D. Jurafsky, L. Zettlemoyer, and M. Lewis. Generalization through memorization: Nearest
+neighbor language models.arXiv preprint arXiv:1911.00172, 2019.
+G. Lample, A. Sablayrolles, M. Ranzato, L. Denoyer, and H. Jégou. Large memory layers with product keys.Advances
+in Neural Information Processing Systems, 32, 2019.
+P. Lewis, E. Perez, A. Piktus, F. Petroni, V. Karpukhin, N. Goyal, H. Küttler, M. Lewis, W.-t. Yih, T. Rocktäschel,
+et al. Retrieval-augmented generation for knowledge-intensive nlp tasks.Advances in neural information processing
+systems, 33:9459–9474, 2020a.
+P. Lewis, E. Perez, A. Piktus, F. Petroni, V. Karpukhin, N. Goyal, H. Küttler, M. Lewis, W.-t. Yih, et al. Retrieval-
+augmented generation for knowledge-intensive NLP tasks. InAdvances in Neural Information Processing Systems,
+volume 33, pages 9459–9474, 2020b.
+J. Li, A. Fang, G. Smyrnis, M. Ivgi, M. Jordan, S. Gadre, H. Bansal, E. Guha, S. Keh, K. Arora, et al. Datacomp-lm:
+In search of the next generation of training sets for language models.Advances in Neural Information Processing
+Systems, 37:14200–14282, 2024.
+Y. Li, Y. Yu, Q. Zhang, C. Liang, P. He, W. Chen, and T. Zhao. Losparse: Structured compression of large language
+models based on low-rank and sparse approximation. InInternational Conference on Machine Learning, pages
+20336–20350. PMLR, 2023.
+K. Meng, D. Bau, A. Andonian, and Y. Belinkov. Locating and editing factual associations in GPT. InAdvances in
+Neural Information Processing Systems, volume 35, pages 17359–17372, 2022.
+K. Meng, A. S. Sharma, A. Andonian, Y. Belinkov, and D. Bau. MEMIT: Mass-editing memory in a transformer. In
+Proceedings of ICLR, 2023.
+S. Merity, C. Xiong, J. Bradbury, and R. Socher. Pointer sentinel mixture models.arXiv preprint arXiv:1609.07843,
+2016.
+R. Nakano, J. Hilton, S. Balaji, J. Wu, L. Ouyang, C. Kim, C. Hesse, S. Jain, V. Kosaraju, W. Saunders, et al.
+Webgpt: Browser-assisted question-answering with human feedback.arXiv preprint arXiv:2112.09332, 2021.
+E. Nichani, J. D. Lee, and A. Bietti. Understanding factual recall in transformers via associative memories.arXiv
+preprint arXiv:2412.06538, 2024.
+F. Petroni, A. Piktus, A. Fan, P. Lewis, M. Yazdani, N. De Cao, J. Thorne, Y. Jernite, V. Karpukhin, J. Maillard,
+et al. Kilt: a benchmark for knowledge intensive language tasks. InProceedings of the 2021 Conference of the
+North American Chapter of the Association for Computational Linguistics: Human Language Technologies, pages
+2523–2544, 2021.
+C. Pilgrim and T. T. Hills. Bias in zipf’s law estimators.Scientific reports, 11(1):17309, 2021.
+O. Press and L. Wolf. Using the output embedding to improve language models. InProceedings of the 15th Conference
+of the European Chapter of the Association for Computational Linguistics: Volume 2, Short Papers, pages 157–163,
+2017.
+A. Roberts, C. Raffel, and N. Shazeer. How much knowledge can you pack into the parameters of a language model?
+arXiv preprint arXiv:2002.08910, 2020.
+14
+===== PAGE 15 =====
+R. Sadhukhan, S. Cao, H. Dong, C. Zhao, A. Purpura-Pontoniere, Y. Tian, Z. Liu, and B. Chen. Stem: Scaling
+transformers with embedding modules. InarXiv preprint arXiv:2601.10639, 2026.
+T. Schick, J. Dwivedi-Yu, R. Dessì, R. Raileanu, M. Lomeli, E. Hambro, L. Zettlemoyer, N. Cancedda, and T. Scialom.
+Toolformer: Language models can teach themselves to use tools.Advances in Neural Information Processing
+Systems, 36:68539–68551, 2023.
+R. Sennrich, B. Haddow, and A. Birch. Neural machine translation of rare words with subword units. InProceedings
+of the 54th Annual Meeting of the Association for Computational Linguistics (Volume 1: Long Papers), pages
+1715–1725, 2016.
+S. Sukhbaatar, J. Weston, R. Fergus, et al. End-to-end memory networks.Advances in neural information processing
+systems, 28, 2015.
+S. Sukhbaatar, E. Grave, G. Lample, H. Jegou, and A. Joulin. Augmenting self-attention with persistent memory.
+arXiv preprint arXiv:1907.01470, 2019.
+A. Virmaux and K. Scaman. Lipschitz regularity of deep neural networks: analysis and efficient estimation.Advances
+in neural information processing systems, 31, 2018.
+B. Wang, W. Ping, P. Xu, L. McAfee, Z. Liu, M. Shoeybi, Y. Dong, O. Kuchaiev, B. Li, C. Xiao, et al. Shall
+we pretrain autoregressive language models with retrieval? a comprehensive study. InProceedings of the 2023
+conference on empirical methods in natural language processing, pages 7763–7786, 2023a.
+H. Wang, S. Agarwal, Y. Tanaka, E. Xing, D. Papailiopoulos, et al. Cuttlefish: Low-rank model training without all
+the tuning.Proceedings of Machine Learning and Systems, 5:578–605, 2023b.
+J. Weston, S. Chopra, and A. Bordes. Memory networks.arXiv preprint arXiv:1410.3916, 2014.
+L. Yin, Y. Wu, Z. Zhang, C.-Y. Hsieh, Y. Wang, Y. Jia, G. Li, A. Jaiswal, M. Pechenizkiy, Y. Liang, et al. Out-
+lier weighed layerwise sparsity (owl): A missing secret sauce for pruning llms to high sparsity.arXiv preprint
+arXiv:2310.05175, 2023.
+B. Zhang and R. Sennrich. Root mean square layer normalization. InAdvances in Neural Information Processing
+Systems, volume 32, 2019.
+G. K. Zipf.Human Behavior and the Principle of Least Effort. Addison-Wesley, 1949.
+15
+===== PAGE 16 =====
+A Background Work
+A.1 Memory Augmented Architectures.
+Memory-augmented models are designed to expand a model’s effective parameter space without incurring
+large computational overhead. Early work on memory networks was introduced by Weston et al. (2014),
+and later extended with fully end-to-end trainable variants with Sukhbaatar et al. (2015). Neural Turing
+Machines (Graves et al., 2014, 2016) incorporate an external, trainable memory that works alongside other
+neural components to simulate a differentiable, trainable computing system. Product-key networks (Lample
+et al., 2019) improve the efficiency and scalability of memory retrieval and propose a key-value memory layer
+that can scale to very large sizes while keeping exact search on the key space. More recently, PEER (He,
+2024) has advanced these ideas by replacing traditional vector-based memory values with rank-one matrices,
+linking memory-augmented architectures with mixture-of-experts models.
+Accurate factual generation remains a critical objective for generative models, often evaluated using open-
+domain question answering benchmarks (Chen et al., 2017; Chen and Yih, 2020) and other tasks requiring
+substantial knowledge (Petroni et al., 2021). Models that can effectively encode factual knowledge from
+training data are better equipped to provide correct responses to knowledge-intensive queries. While larger
+models generally demonstrate improved factual accuracy (Roberts et al., 2020; Brown et al., 2020), halluci-
+nation remains a persistent challenge. One effective approach for mitigating this issue is retrieval-augmented
+generation, which leverages external knowledge sources to improve factual consistency (Lewis et al., 2020a;
+Karpukhin et al., 2020; Khandelwal et al., 2019). Several language models have incorporated text retrieval
+from the pretraining stage. REALM (Guu et al., 2020) augments a BERT model with one retrieval step to
+solve QA tasks. Retro (Borgeaud et al., 2022a) enhances auto-regressive decoding with multiple rounds of
+retrieval, once per 64 tokens. The retrieved texts are injected through a two-layer encoder and then several
+cross-attention layers in the decoder. Retro++ (Wang et al., 2023a) explores the scalability of Retro by re-
+producing Retro up to 9.5B parameters. Meanwhile, several models are adapted to retrieval in the finetuning
+stage. WebGPT (Nakano et al., 2021) learns to use search engine through imitation learning in a text-based
+web-browsing environment. Toolformer (Schick et al., 2023) performs decoding with multiple tools including
+search engine, and the finetuning data is labeled by the language model itself.
+A.2 Understanding Feed-Forward Networks in Transformers.
+Several studies have investigated the role of feed-forward networks (FFNs) in transformers, particularly their
+contribution to storing and retrieving knowledge learned during pretraining. Geva et al. (2021) demonstrated
+that FFNs can be interpreted as key–value memories that activate on specific lexical or semantic patterns,
+while follow-up work showed that FFNs promote vocabulary-level concepts during prediction (Geva et al.,
+2022a). Additional related analyses in embedding space further explored how FFN activations correspond
+to linguistic features and factual recall (Dar et al., 2023; Nichani et al., 2024). Within their framework, the
+first layer acts as a pattern detector (“keys") while the second layer projects specific information into the
+residual stream (“values"). This modularity is evidenced by the identification of specific “knowledge neurons"
+responsible for storing distinct facts. More broadly, the interpretation of neural networks as associative or
+persistent memory systems connects this line of work to earlier memory-augmented architectures (Sukhbaatar
+et al., 2019). However, these analyses rely on contextualized residual activations and require extensive
+post-hoc mining of calibration data, making the inferred query space indirect and difficult to interpret.
+Furthermore, since FFNs operate exclusively on its contextualized residual stream, their ability to distinguish
+tokens is mathematically bottlenecked when distinct token appears in identical syntactic context which leads
+to the contextual collapse problem. Recently, MoLE (Jie et al., 2025), illustrates that in mixture-of-experts
+(MoEs), majority of experts can be trained directly with token-level input embeddings. Following the static
+routing concept, MemoryLLM (Jaiswal et al., 2026) completely decouples FFNs from the contextual residual
+stream by directly training a layer-local and token-indexed embedding table to enhance interpretability and
+reduce compute. Concurrently, in the STEM (Sadhukhan et al., 2026) architecture, FFN is partially replaced
+to embedding table, with the substitution occurring at the up-projection layer. TIDE builds upon this token-
+level intuition but fundamentally diverges from standard FFNs. Instead of relying on contextual mixtures
+vulnerable to collapse, TIDE bypasses this entirely by injecting a context-free token identity directly into
+16
+===== PAGE 17 =====
+residual stream at every depth.
+A.3 Advancements with Embedding and Modern LLMs.
+Standard transformer models rely on a single-injection assumption where token embeddings are looked up
+once at the input layer and subsequently faded out. Since language vocabularies strictly obey Zipf’s law
+(Zipf, 1949; Pilgrim and Hills, 2021), majority of tokens infrequently appear in the training corpus. Sub-
+word tokenization (Sennrich et al., 2016) is introduced to mitigate out-of-vocabulary issue, yet they do not
+resolve the fundamental long-tail distribution of tokens, which continues to degrade the performance of con-
+textualized embeddings on rare words. Under standard stochastic gradient descent, this skewed distribution
+leads to gradient starvation for rare tokens. Embedding sharing (Inan et al., 2017; Press and Wolf, 2017)
+attempt to stabilize training of embedding by tying input and output embedding weights, allowing input
+representations to benefit directly from the richer gradient signal of the pre-softmax layer. However, simply
+sharing parameters between the input and output layers does not structurally resolve the gradient starvation
+on low-frequency tokens. TIDE directly solve this gradient starvation bottleneck by utilizing independent
+memory blocks which lead to amplification of gradient signals to token representations, disproportionately
+benefiting rare tokens.
+B Details of Frequency Bins Generated from Vocabulary
+The WikiText-103 training split is tokenized with the LLaMA-3 tokenizer (|V|= 128,256, sequence length
+T= 2,048), producing a token stream of∼120M tokens over∼58k sequences, of which 65,569 vocabulary
+entries appear at least once. Raw occurrence counts are then passed through a structural filter that removes
+BOS/EOS special tokens, pure-whitespace tokens, and non-alphanumeric punctuation. In total, 28 tokens
+(0.04%of observed types) are removed, leaving 65,541 token types for the binning procedure.
+Table 3Frequency decile bin reference for WikiText-103 with the LLaMA-3 BPE tokenizer (128K vocabulary) after
+structural filtering. Each bin contains≈6,554token types ranked by corpus frequency. Representative example tokens
+are drawn from each tier for semantic illustration.
+Bin Freq. range Types Description Role
+0 1–2 6,555 Hapax & near-hapax tokens Rare
+1 2–6 6,554 Domain-specific, rare names Rare
+2 6–20 6,554 Uncommon words, rare entities Rare
+3 20–61 6,554 Infrequent content words Mid
+4 61–133 6,554 Occasional content words Mid
+5 133–240 6,554 Moderate-frequency words Mid
+6 240–416 6,554 Fairly common content words Mid
+7 416–769 6,554 Common function + content wordsCommon
+8 769–1,856 6,554 High-frequency content words Common
+9 1,856–999,999 6,554 Highest-frequency (below cap) Common
+Rare examples (Bins 0–2) cefuroxime,morgan,Produto,Teotihuacan,toujours
+Mid examples (Bins 3–6) volcano,diocese,battalion,peninsula,sculptor,harbour
+Common examples (Bins 7–9) there,their,also,however,first,time
+Decile assignment of Token Types:The 65,541 cleaned types are sorted by ascending corpus frequency
+and partitioned intoB= 10equal-cardinality bins, each containing≈6,554types, with bin index assigned
+17
+===== PAGE 18 =====
+as:
+b(v) = min
+(⌊rank(v)
+|Vclean|·B
+⌋
+, B−1
+)
+.(B.1)
+Bin assignment is determined by rank alone while the absolute frequencies establish the ordering. Crucially,
+while every bin contains the same number of tokentypes, the bins account for vastly different shares of the
+training tokenstreamunder Zipf’s law. Throughout this paper, Bins{0−2}are referred to asrare , Bins
+{3−6}asmid-frequency , and Bins{7−9}ascommon tokens.
+C Gradient Starvation Bound: Derivation of Equation (2.1)
+The lossLs depends onev only through positions inbatchs that equalv. Ifv /∈batchs, then∂L s/∂ev =0
+exactly. Formally, we can write as:
+∇evLs =0wheneverv /∈batch s.(C.1)
+Let’s defineX s :=1[v∈batch s]. Since each of theBTpositions is drawn i.i.d. from{f v}, the event
+{v /∈batchs}requires allBTdraws to avoidv, each with probability(1−f v). Therefore:
+Pr[v∈batch s] =E[X s] = 1−(1−f v)BT ≤f v·B·T,(C.2)
+where the inequality applies the Bernoulli bound(1−fv)BT≥1−f vBT, valid forfv∈[0,1].
+Next, we bound the cumulative squared gradient using equation equation C.1, as∥∇ evLs∥2 ≤G 2·X s.
+Taking expectations and summing overτsteps:
+E
+[ τ∑
+s=1
+∥∇evLs∥2
+]
+≤
+τ∑
+s=1
+G2·E[Xs]≤τ·f v·B·T·G 2,(C.3)
+which completes the derivation of equation 2.1.
+C.1 Understanding the Ratio of Gradient for Rare and Common Tokens
+Letvbe a rare token withf v =ε≪1/(BT)andua common token withf u ≥c >0. Using the
+aforementioned derivation, we have
+E
+[ τ∑
+s=1
+∥∇evLs∥2
+]
+≤τ·ε·BT·G 2.(C.4)
+To determine the lower bound for common frequency tokens, we assume a standard non-degeneracy condition:
+whenever tokenuappears in batchs, the per-step squared gradient norm satisfies∥∇ euLs∥2≥G 2min >0
+on the event{u∈batch s}. This holds throughout training whenever the cross-entropy loss has not been
+minimized on tokenu.
+DefiningX (u)s :=1[u∈batch s]and using∥∇ euLs∥2≥G 2min·X (u)s , we take expectations and sum overτ
+steps:
+E
+[ τ∑
+s=1
+∥∇euLs∥2
+]
+≥τ·Pr[u∈batch]·G 2min =τ (1−(1−f u)BT)G2min.(C.5)
+Sincef u≥c>0and1−(1−x) n is non-decreasing inx:
+1−(1−f u)BT ≥1−(1−c) BT =:κ >0,(C.6)
+whereκis a strictly positive constant depending only onc,B,T. Substituting it into equation C.5 gives:
+E
+[ τ∑
+s=1
+∥∇euLs∥2
+]
+≥τκG 2min.(C.7)
+18
+===== PAGE 19 =====
+To determine the ratio between rare and common tokens, we divide equation C.4 by equation C.7:
+E
+[∑
+s
+∥∇evLs∥2
+]
+E
+[∑
+s
+∥∇euLs∥2
+] ≤ τεBTG 2
+τκG 2min = BT·G 2κ·G 2min·ε(C.8)
+SinceBT,G 2, andG 2min are fixed positive constants. By the first-order Taylor expansion for smallc, we
+have:
+κ= 1−(1−c) BT ≈c·BT ,(C.9)
+so the prefactor satisfies:
+BT·G 2
+κ·G 2min = BT·G 2(c·BT)·G 2min = G2c·G 2min =O (1c),(C.10)
+and the full bound on the ratio isO(ε/c), which completes the proof of equation 2.3.
+Concrete evaluation on WikiText-103.Withε= 8.3×10 −9 (Bin-0 rare tokens,nv = 1),c= 8.3×10 −3
+(Bin-9 common token,nu≈10 6),B= 8,T= 2048:
+κ= 1−(1−c) BT ≈1−e −cBT = 1−e −136 ≈1,(C.11)
+ε
+c = 8.3×10 −98.3×10 −3 = 10−6.(C.12)
+Under the conservative assumptionG2/G2min = 10, the gradient signal accumulated by a Bin-0 hapax embed-
+ding is bounded above by10−5 times that of a Bin-9 common token over the same training run, there exists
+a gradient disparity of five orders of magnitude.
+D Full Proof of Proposition 2.2
+We prove that for any collapsed pair(u,v)∈C (ℓ)δ and any target functiong:V→R d with∥g(u)−g(v)∥=
+C > LFFNδ, no setting of the FFN weights can approximategto error less than(C−L FFNδ)/2on both
+tokens simultaneously.
+By definition of the contextual collapse set,(u,v)∈C (ℓ)δ implies∥h u−hv∥≤δ. Since FFNs are Lipschitz in
+its hidden-state input (Virmaux and Scaman, 2018), we have
+∥FFN(hu)−FFN(h v)∥ ≤L FFNδ.(D.1)
+The FFN outputs foruandvmust therefore lie within a ball of radiusL FFNδof each other — they cannot
+be far apart, regardless of how the weightsW1,W 2 are chosen.
+Using triangle inequality on the target separation, we can write the target separation as:
+C=∥g(u)−g(v)∥
+=∥g(u)−FFN(h u) + FFN(hu)−FFN(h v) + FFN(hv)−g(v)∥
+≤∥g(u)−FFN(h u)∥+∥FFN(h u)−FFN(h v)∥+∥FFN(h v)−g(v)∥.(D.2)
+By substituting Lipschitz bound equation D.1 into equation D.2:
+C≤ ∥g(u)−FFN(h u)∥+L FFNδ+∥g(v)−FFN(h v)∥.(D.3)
+Rearranging equation D.3 to isolate error terms:
+∥g(u)−FFN(h u)∥+∥g(v)−FFN(h v)∥ ≥C−L FFNδ.(D.4)
+19
+===== PAGE 20 =====
+The left-hand side is the sum of two non-negative approximation errors. WhenC > LFFNδ, the right-hand
+side is strictly positive, so at least one of the two errors is positive. Specifically, since the maximum of two
+non-negative numbers is at least half their sum:
+max
+{
+∥g(u)−FFN(h u)∥,∥g(v)−FFN(h v)∥
+}
+≥ C−L FFNδ2 .(D.5)
+whenC >L FFNδ, the right side is strictly positive, which completes the proof.
+Three quantities govern the bound among which none of which are under the FFN’s control:
+•Target separation(C): The required difference∥g(u)−g(v)∥between the optimal representations of
+tokensuandv. This is determined by what the downstream task needs — for example, the grammatical-
+class distance between“their”(possessive determiner) and“there”(locative adverb) is fixed by the
+language, not by the model’s architecture.
+•Input proximity(δ): The distance∥h u−h v∥between the hidden states that the attention layer
+produces foruandv. When two tokens appear in nearly identical contexts with same surrounding
+words and same syntactic position - attention cannot distinguish them, andδis small. The FFN
+receivesh u andh v as inputs; it cannotchooseto receive different inputs.
+•FFN change limit(L FFN): The Lipschitz constant controls how rapidly the FFN output can change
+per unit change in input. WhileLFFN depends on the weights and could in principle be made large,
+doing so causes exploding gradients and training instability. A largeLFFN amplifies the FFN’s response
+toeveryinput perturbation which is not only limited to the gap betweenh u andh v. This sharply
+degrades performance on the majority of tokens whose hidden states are not collapsed.
+E Full Proof of Proposition 3.1
+We prove that for anyϵ>0there exist finite router parametersWℓr such that‖‖mℓ(v)‖‖<ϵfor allv∈Vand
+ℓ∈{1,...,L}.
+GivenM K+1(v) =0by definition, for any router weightαℓK+1∈(0,1):
+αℓK+1·MK+1(v) =α ℓK+1·0=0.
+This ensures that null bank contributes nothing toTIDE. The memory term therefore simplifies to:
+mℓ(v) =
+K+1∑
+k=1
+αℓkMk(v) =
+K∑
+k=1
+αℓkMk(v).
+By the softmax constraint equation 3.5,∑Kk=1αℓk = 1−α ℓK+1. Applying the triangle inequality, we can
+bound the memory norm as:
+‖‖mℓ(v)‖‖ ≤ K∑
+k=1
+αℓk∥Mk(v)∥ ≤(1−α ℓK+1)·C,(E.1)
+whereC= max v∈V,k≤K ∥Mk(v)∥<∞.
+Next, we express the active weight sum in terms of the null logit. Upon settingzℓK+1 =s>0andz ℓk = 0for
+allk≤K. By softmax:
+1−α ℓK+1 = KK+e s.(E.2)
+Ass→∞,K/(K+e s)→0, so the total active bank weight vanishes.
+Substituting equation E.2 into equation E.1:
+‖‖mℓ(v)‖‖≤KC/(K+e s). For anyϵ∈(0,C), solvingKC/(K+
+es) =ϵgives:
+s∗ = log
+(K(C−ϵ)
+ϵ
+)
+.(E.3)
+20
+===== PAGE 21 =====
+Now, we have:KC/(K+e s∗) =KCϵ/KC=ϵ. Therefore ‖‖mℓ(v)‖‖≤ϵuniformly over allvandℓfor any
+s≥s ∗.
+Note that, the thresholds∗ is finite for anyϵ∈(0,C). SettingW ℓr so thatW ℓr ˜nℓ ≈s ∗ eK+1 is a finite
+parameter assignment under which
+‖‖mℓ(v)‖‖<ϵfor allvandℓ.
+Additional Remark:From equation E.2, ∑Kk=1αℓk =K/(K+e zℓK+1)dependsonlyon the null logitz ℓK+1.
+A single large null logit jointly suppresses allKactive banks through softmax competition facilitating the
+suppression degree of freedom to one scalar, regardless ofK.
+F Full Proof of Proposition 3.2: K-Pathway Gradient Amplification
+For simplicity, Proposition 3.2 is stated for a simplified router overKactive banks that excludes the null
+bank at slotK+1.
+For a fixed tokenv∈Vand lete (k)v denote the row of embedding tableEk corresponding tov, fork= 1,...,K.
+DefineX s :=1[v∈batch s]. As established in Appendix C with Bernoulli Bound, we have:
+E[Xs] = 1−(1−f v)BT =:κ v≤f v·BT.(F.1)
+Given that theKMemoryBlocks have no shared parameters, the gradient with respect toe(k)v is identically
+zero wheneverv /∈batchs, and otherwise:
+∇e(k)v Ls =
+L∑
+ℓ=1
+αℓk· ∂Ls∂mℓ(v)· ∂Mk(v)∂e(k)v ,(F.2)
+where∂L s/∂mℓ(v)is the upstream gradient from layerℓ’s residual stream. SinceMk(v)enters every layer,
+each block accumulates gradient contributions across allLlayers.
+During training, wheneverv∈batch s and the loss has not been minimized on tokenv, we assume the
+standard non-degeneracy condition: for eachk, there exists at least one layerℓ∗ such that
+‖‖‖∇e(k)v Ls‖‖‖2≥G 2min >0on the event{v∈batch s}.(F.3)
+Since theKblocks are independent and each satisfies Equation F.3, and∇e(k)v Ls =0exactly whenX s = 0
+(tokenvabsent from batch), we have
+‖‖‖∇e(k)v Ls‖‖‖2≥G 2min·Xs. Summing acrossKblocks:
+K∑
+k=1
+‖‖‖∇e(k)v Ls‖‖‖2 ≥K·G 2min·Xs.(F.4)
+Taking expectations and summing overτsteps completes the proof of equation 3.7:
+E
+[ τ∑
+s=1
+K∑
+k=1
+‖‖‖∇e(k)v Ls‖‖‖2] ≥K·τ·κ v·G 2min.(F.5)
+Additional Remark:The standard transformer upper bound givesE
+[∑
+s∥∇evLs∥2
+]
+≤τ·f v·BT·G 2
+from Appendix C. TheTIDElower bound isKtimes the analogous single-block lower bound, confirming a
+K-fold amplification under the assumptionG2/G2min =O(1).
+21
+===== PAGE 22 =====
+G Additional Details for Proposition 3.3: Contextual Collapse and TIDE’s
+K-MemoryBlocks
+Proposition 3.3 state that for any collapsed pair(u,v)∈C(ℓ)δ with‖‖‖h(ℓ)u −h (ℓ)v ‖‖‖≤δ, and any target separation
+C >0, there existEmbeddingMemoryparameters{E k}Kk=1 such that∥M k(u)−M k(v)∥=Cfor any
+K≥1.
+From Equation 3.3, we haveMk(v) = RMSNorm(Ek[v]), whereEk[v]is the row ofEk∈R|V|×d b selected by
+discrete indexv.
+The hidden stateh (ℓ)v does not appear in equation 3.3, soM k(u)andM k(v)are independent ofδ=‖‖‖h(ℓ)u −h (ℓ)v ‖‖‖. This stands in direct contrast to the FFN, for which Lipschitz continuity forces for the
+∥FFN(hu)−FFN(h v)∥ ≤LFFNδregardless of the weights chosen, bounding the output separation from
+above byL FFNδ.
+Since rowsEk[u]andE k[v]are uncoupled parameters, the tableEk assigns one dedicated row per vocabulary
+entry with no joint constraint, so assigning one row places no restriction on the other, regardless ofδ.Mk(u)
+andM k(v)can be set to any two vectors in the output range ofRMSNormindependently. In particular,
+for any targetC >0there trivially exist row assignments such that∥M k(u)−M k(v)∥=C, regardless of
+δ=
+‖‖‖h(ℓ)u −h (ℓ)v ‖‖‖ and independently ofLFFN.
+104
+105 L=0: +120.0x10^3%
+L=0: +10.0x10^3%
+L=0: +1.7x10^3%
+(a) Absolute PPL when memory is ablated at a single layer
+0 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19
+Dropped Layer Index
+10
+12
+14
+16
+18
+20perplexity
+DCLM  17.24  (+8.7%)
+PubMed  12.42  (+12.9%)
+WikiT ext  10.60  (+8.1%)
+L = 1
+WikiT ext-2 DCLM PubMed
+104
+105
+106 L=0: +1.09x10^6%
+L=0: +101.9x10^3%
+L=0: +10.6x10^3%
+(b) Relative Degradation per Layer
+0 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19
+Dropped Layer Index
+0
+5
+10
+15 PPL (%) wrt. Baseline
+PubMed  +12.9%
+DCLM  +8.7%
+WikiT ext  +8.1%
+L = 1
+Figure 11Marginal contribution of each layer’s memory injection in TIDE.The routedEmbeddingMemory
+output at one layerℓis zeroed while all other layers retain their full pathway; we report perplexity on WikiText-2,
+DCLM, and PubMed. Relatively higher degradation in PubMed performance also aligns with our rare-token problem.
+22
+===== PAGE 23 =====
+H Understanding Layer-wise Contribution of EmbeddingMemory
+InTIDE,weproposetoaddEmbeddingMemorytotheresidualstreamateverytransformerlayer, anatural
+question arises:Is each layer’s memory injection equally important, or does it contribute disproportionately
+at certain depths of the network?To probe this, we sweep the layer indexℓ∈{0,1,...,L−1}of ourTIDE-
+1B model and, at each sweep point, replace the routed memory contribution at layerℓalone with the zero
+vector while leaving the router andMemoryBlocks pathway at every other layer untouched. Concretely,
+the standardTIDEforward pass at layerℓis given as per Equation 3.6 as:
+hℓ = ˜hℓ + FFN(˜nℓ) +mℓ(v).
+becomesh ℓ = ˜hℓ + FFN(˜nℓ) for the single ablated layerℓ, where ˜hℓ = RMSNorm(hℓ + Attnℓ(hℓ))and
+Memℓ denotes the routed sum over theK=24MemoryBlocks. We then evaluate perplexity on WikiText-2,
+DCLM, and PubMed, repeating for everyℓto obtain a per-layer marginal-contribution profile.
+Memory contribution is intermittent, not monotone:Figure 11 reveals that the contribution of
+EmbeddingMemoryisnot uniform across depthof the trainedTIDEcheckpoint. Dropping layer0collapses
+the model entirely and the perplexity rises by more than103%on every dataset and reaches1.09×10 6%on
+PubMed, indicating that the first memory injection carries an irreplaceable importance for the model. Layer1
+remains substantially load-bearing (+8.1% to+12.9%across datasets), suggesting a brief consolidation period
+during which token-identity information is propagated into the residual stream. After this, degradation falls
+sharply: every layer in the contiguous rangeℓ∈[4,12]lead to less than∼2% PPL cost.
+We additionally observe a clear secondary peak at layer13, where layer dropping costs new spike in perfor-
+mance degradation. We interpret this pattern as evidence that token-identity information injected by early
+EmbeddingMemorylayerspersistsin the residual stream for several intermediate layers, during which any
+single memory contribution becomes redundant. Once this token-identity signal is consumed by the ongoing
+contextual computation, memory information is again required to refresh it at intermittent intervals.
+I Understanding Decoding Cost with MemoryBlocks
+In this section, we aim to investigate how does our proposed architectureTIDE-1B empirically perform wrt.
+LLaMa-Base-1B in terms of decoding speed (ms/token). All experiments are reported using 1×B200 GPU
+averaged across 5,120 generated tokens.
+Table 4Token Decoding estimated forTIDE-1B variants in comparison to LLaMa-Base-1B transformer model.
+LLaMa-Base-1BTIDE-2E-1BTIDE-4E-1BTIDE-8E-1BTIDE-16E-1BTIDE-24E-1B
+Decoding Speed (ms/token) 11.085 11.236 11.854 12.688 12.901 13.422
+J Investigating Compression Strategies for EmbeddingMemory
+Our proposedTIDEarchitectures provide an opportunity to offload each staticMemoryBlocks within
+theEmbeddingMemoryto storage devices in resource-constrained settings with asynchronous pre-fetching.
+This leads to the question:How does the trade-off between VRAM and storage devices look like and what can
+be done to minimizeMemoryBlocks storage cost?
+We first estimate the total storage cost ofMemoryBlockas follows:
+Storage Size= vocab_size×num_blocks×hidden_dim×bits_per_param(J.1)
+For ourTIDE-8E-1B model with 24 layers and 2048 hidden dimension which are trained with LLaMa-3.1
+tokenizer with 128,256 vocabulary size,∼4.2 GB of storage space is required forEmbeddingMemorywith
+23
+===== PAGE 24 =====
+F16 precision. To address our question, we performed a preliminary investigation2 of storage challenges of
+EmbeddingMemoryfromtwo different perspectives:
+D1. Quantization ofEmbeddingMemory, and
+D2. Low Rank compression of individualMemoryBlock,
+J.1 Quantization of EmbeddingMemory.
+Table 5Performance comparison ofTIDE-8E-1B with various low-precision ofMemoryBlocks.
+Precision Size (GB) Wikitext-2 (↓) PubMed (↓) DCLM (↓)
+16-bit 4.20 GB 10.088 11.100 16.108
+8-bit 2.10 GB 10.089 11.100 16.113
+4-bit 1.05 GB 10.263 11.277 16.343
+J.2 Low Rank Compression of Token-wise MemoryBlocks.
+Several recent works (Li et al., 2023; Wang et al., 2023b; Kaushal et al., 2023) have explored the low-rank
+characteristics associated with weights and gradients to address storage demands and computational complex-
+ity linked to the large matrices of LLMs. For ourTIDE-8E-1B model checkpoint with 8MemoryBlocks,
+each block holds an embedding tableMk∈R|V|×d b that maps a token indexv∈Vto ad b-dimensional vector.
+A rank-rSVD decomposition ofMk yields two matricesU∈R |V|×r andV∈R r×db, and rather than storing
+Mk directly we can store the factored representation(U,V)providedris small enough that the factored form
+has fewer parameters. We estimate the rankr, below which storage of(U,V)will save space as follows:
+(|V|·r) + (r·d b)≤ |V|·d b =⇒r≤ |V|·d b|V|+d b.(J.2)
+ForTIDE-8E-1B with hidden dimensiond= 2048, bottleneck dimensiondb = 2048, and the LLaMA-3.1 tok-
+enizer of vocabulary size|V|= 128,256, Equation J.2 givesr≤2015, so any uniform rank reduction of at least
+∼2% across the eightMemoryBlocks is sufficient to reduce storage relative to the dense parameterization.
+0 10 20 30 40 50 60 70 80 90
+Uniform Rank Reduction (%)
+0
+20
+40
+60
+80Perplexity
+WikiT ext-2
+DCLM
+PubMed
+0 10 20 30 40 50 60 70 80 90
+Uniform Rank Reduction (%)
+0
+100
+200
+300
+400
+500
+600 PPL (%)
+WikiT ext-2
+DCLM
+PubMed
+Figure 12Uniform rank reduction across all 8 MemoryBlocks of TIDE-8E-1B.EachM k ∈R |V|×d b is
+replaced by its rank-rSVD approximation withr=⌈(1−p)·d b⌉applied identically to every block.(a)Absolute
+perplexity on WikiText-2, DCLM, and PubMed; dotted horizontal lines mark each dataset’s uncompressed baseline.
+(b)Relative degradation of perplexity which is largely flat through∼30% reduction, degrades gradually through
+∼60%, and rises sharply beyond 70%.
+2An effective novel compression technique forEmbeddingMemorycompression is out of the scope of this work. Our prelim-
+inary investigation reveals a high redundancy within theMemoryBlocks and leaves sophisticated studies to capitalize these
+redundancies as future work.
+24
+===== PAGE 25 =====
+Figure 12 sweeps the uniform reduction percentage from 0% to 90% in 10% increments and reports per-
+plexity on WikiText-2, DCLM, and PubMed. At modest reductions (10–30%,r∈[1434,1844]), perplexity
+degradation remains almost flat while parameter count perMemoryBlockdrops to as little as 71% of the
+dense form. At moderate reductions (40–60%,r∈[820,1229]), degradation grows around∼10% to∼25%
+but remains gradual. However, beyond 70% reduction the curves bend sharply upward and the relative
+∆PPL reaches 587% on WikiText-2, 484% on DCLM, and 657% on PubMed. Our findings indicate that a
+TIDE MemoryBlocks can be significantly compressed up to a∼50% rank reduction (r= 1024, halving
+the per-block parameter count) at uniform with marginal drop in performance for practical purpose with
+limited resource availability. Provided the existence of non-uniform low-rank properties across different lay-
+ers (Jaiswal et al., 2024a), we strongly believe thatEmbeddingMemorycan be further compressed using
+non-uniform rank reduction techniques for relatively superior performance compared to uniform SVD.
+K K-Nearest Neighbor Study of Base Embedding and MemoryBlocks
+To understand Base andMemoryBlockembeddings from semantic perspective, we ask an interesting
+question:At individual token-level, do theMemoryBlocks recover semantic neighbors that the primary
+embeddingEhas failed to learn during training?To probe this, we compute the per-token Jaccard overlap
+Jk between the top-10 cosine neighbors across 200 randomly sampled rare and common token underEand
+eachM k.
+In Figure 13, we present the distribution ofJk over tokens and find that rare-token boxes lie consistently
+below the common-token boxes for everyK. It indicates that for common tokens, the neighbor sets agree
+more closely withEbut for rare tokens neighbor sets aresubstantially disjointadding complementary and
+non-overlapping information about them. For example, in Table 6 with concrete examples: for a rare token
+asynchronously,E’s top-10 are dominated by adverbs ending in {-ly}; but eachMemoryBlocks con-
+tribute additional closely related technical information (e.g.M2 surfacesAsynchronous JavaScript and XML,
+callbacks;M 3 surfacesdefensively, securely) in pursuit to enhance the semantic structure.
+The rare-name queryfredshows the same pattern:Ereturns only first-name neighbors, while individual
+MemoryBlocks additionally recover orthographic variants (Fred,Frederick,Freddy), tokenizer fragments
+(Freder), and cross-lingual variants (Hans,Viktor). The complementary-information picture therefore not
+a global statistical artifact but reflects genuine per-token specialization ofMemoryBlocks.
+M1 M2 M3 M4 M5 M6 M7 M8 M
+MemoryBlock Pathway
+0.0
+0.2
+0.4
+0.6
+0.8
+1.0Jaccard (Mk, E)
+Rare tokens (bins 0 2)
+Common tokens (bins 7 9)
+Figure 13Cosine-Nearest Agreement between primary embeddingEand memory blocksM k across forrareand
+commontokens. Rare-token boxes lie consistently below common-token boxes indicating memory blocks pathways
+encode neighbor sets that aresubstantially disjointfromEfor the rare tokens and add complementary new information
+to model.
+25
+===== PAGE 26 =====
+Table 6Top-10 Cosine-Nearest neighbors of two rare query tokens in the primary embedding tableEand across 8
+MemoryBlockinTIDE-8E-1B (M 1,M 2,...,M 8) model checkpoints. Row backgrounds encode per-block Jaccard
+rank against the Base top-10 within each query, withdarkershades indicatinghigherJk (more neighbor-set agreement
+with Base).
+Query Pathway Top-10 nearest neighbors (cosine) Jk
+BaseE asynchronous,ynchronously,sequentially,recursively,dynamically,ynchronous,concurrently,independently,horizontally,seamlessly –
+M1 asynchronous,ynchronously,synchronous,ynchronous,silently,globally,callback,concurrently,digitally,unsafe 0.25
+M2 asynchronous,ynchronously,Asynchronous JavaScript and XML,callbacks,synchronous,ynchronous,LSD,hashtags,conditionally,breathable 0.18
+M3 ynchronously,asynchronous,recursively,ynchronous,sequentially,defensively,resonate,dynamically,callbacks,securely 0.43
+M4 asynchronous,ynchronously,concurrently,synchronous,ynchronous,dynamically,anonymously,externally,parallel,simultaneously 0.33
+M5 asynchronous,ynchronously,simultaneously,recursively,spontaneously,sequentially,efficiently,tirelessly,separately,independently 0.33
+M6 asynchronous,synchronous,Asynchronous JavaScript and XML,instantiated,serialize,scalable,serialized,ynchronously,caching 0.11
+M7 asynchronous,ynchronously,manually,Premiere,optionally,reordered,indefinitely,RMS,factorial,charcoal 0.11
+asynchronously
+M8 asynchronous,synchronous,ynchronously,ynchronous,dynamically,synchronized,concurrently,electronically,simultaneously,automatically 0.33
+BaseE Fred,Fred,Larry,Roger,Doug,Charlie,Sean,jim,Mike,Jake –
+M1 Fred,Fred,joe,john,Ginny,Frederick,Doug,Lena,Woody,zar 0.18
+M2 Fred,Fred,alf,Freder,Maggie,Carlo,Viktor,alan,Noel,Amit 0.11
+M3 Fred,Fred,fred,mary,bob,Bob,Frederick,Bob,Freder,Herbert 0.11
+M4 Fred,Fred,martin,Martin,Zack,Bernie,Frederick,alex,Charlie,Albert 0.18
+M5 Fred,Fred,christ,Nora,brahim,Dani,tek,Enterprise,Yo,Practice 0.11
+M6 Fred,Fred,Katy,Hans,Ogre,Nel,Sing,Ian,Berk,Toby 0.11
+M7 Fred,Fred,fred,Ron,Doug,COST,Todd,Evelyn,Lindsey,Apache 0.11
+fred
+M8 Fred,Fred,fred,Frederick,Freddy,Ned,Freddie,Geoff,Fried,red 0.11
+L Model Training Implementation Details
+Loss
+Training Iteration
+Figure 14Training Loss Comparison of LLaMa-1B and TIDE-1B with 2, 4, 8, 16, and 24MemoryBlocks.
+M Limitations and Future Work
+While TIDE delivers consistent gains across model scales and downstream tasks, we would like to acknowledge
+some limitations.❶Storage overhead:Despite the EmbeddingMemory tables are static and quantization
+friendly, the SSD footprint still scales linearly withK. Deployments with strict storage budgets need to rely
+on the compression strategies discussed in Appendix J, along with conventional techniques (Jaiswal et al.,
+2023, 2024b; Li et al., 2023; Yin et al., 2023) to reduce SSD overhead.❷Our experiments cover model scales
+from 750M to 3B parameters trained on 200–500B tokens of DCLM, with evaluations on WikiText, PubMed,
+DCLM, and eight zero-shot benchmarks. The benefits ofTIDEremain unexplored for longer training
+horizons, after instruction tuning or RLHF and is left to future work.❸Per-block router statistics and
+nearest-neighbor analyses (Appendix 6) suggest that distinct MemoryBlocks specialize to distinct frequency
+regimes, we do not provide a principled account ofwhateach block learns. A more fine-grained interpretability
+study of memoryblocks specialization is an important direction for future work.
+26
+===== PAGE 27 =====
+Table 7Model training configurations for ourBase,TIDEModels. All model checkpoints are trained within the
+paper adopt exactly same configuration for fair comparison.
+Category Key Value
+Common Tokens Count 400-500 Billion
+Vocabulary size 128,256
+Tokenizer meta-llama/Llama-3.1-8B
+Dataset mlfoundations/dclm-baseline-1.0
+Sequence Length 2048
+Hidden Activation SiLU
+Loss Name Cross Entropy
+Z-loss 1.0e-6
+Optimizer Name Adam
+Weight Decay 0.1
+Beta1 0.9
+Beta2 0.95
+Schedular Warmup Initial LR 1e-06
+Warmup Iterations 10000
+Type Cosine
+Max LR 1.0e-04
+Min LR 1.0e-05
+27
